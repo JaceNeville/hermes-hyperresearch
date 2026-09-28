@@ -32,3 +32,20 @@ GEMINI.md
 research/
 
 .knack/
+
+# --- hermes-hyperresearch fork: never commit local/private state ---
+# Deployment config (hosts, tailnet addresses, vault paths) lives outside the
+# repo; these patterns are a backstop in case a copy lands in the tree.
+*.local.toml
+*.local.yaml
+hermes.local.*
+deploy/local/
+.env.*
+*.pem
+*.key
+*.cred
+secrets/
+# Vault / research output
+vault/
+*.sqlite
+*.sqlite3

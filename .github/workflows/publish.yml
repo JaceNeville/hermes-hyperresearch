@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   build:
+    # Fork guard: only the upstream repo publishes to PyPI.
+    if: github.repository == 'jordan-gibbs/hyperresearch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

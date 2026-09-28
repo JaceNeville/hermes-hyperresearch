@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Blocks the commit if gitleaks finds a secret in staged changes.
+# Enable once per clone:  git config core.hooksPath .githooks
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not installed; refusing to commit (https://github.com/gitleaks/gitleaks)" >&2
+  exit 1
+fi
+exec gitleaks git --staged --redact --no-banner -v .
