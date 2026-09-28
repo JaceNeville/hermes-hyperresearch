@@ -240,7 +240,17 @@ The procedure below was written for another runtime. Map it as follows:
 - **Write / patch a file** -> `write_file` for new files, `patch` for surgical edits.
 - **Shell** -> `terminal`. Always pass `timeout=600` for `hpr hermes spawn` and `hpr hermes wait`.
 - **Plan** -> the `todo` tool.
-- **Web search** -> `web_search`. Never fetch source pages yourself; use `{hpr} fetch`.
+- **Web search** -> `web_search`, for planning only.
+
+### You do not fetch or read sources (enforced)
+
+`{hpr} fetch` and `{hpr} fetch-batch` refuse to run in your session (error code
+`DELEGATE_FETCH`). Every source page goes through `hyperresearch-fetcher`
+subagents, which fetch, read, and extract claims on a cheaper model in their own
+short sessions. You work from their outputs: `{hpr} note list`, claims files, and
+the notes they flag. Don't `read_file` full source notes to "check" a fetcher's
+work; that re-imports the very context delegation exists to keep out. On light
+tier, still spawn 2-3 fetchers with non-overlapping batches.
 
 ### Spawning subagents
 
@@ -444,11 +454,47 @@ def build_chat_cmd(
     return cmd + list(cfg.extra_args)
 
 
-def chat_env(workdir: Path) -> dict[str, str]:
-    """Environment for a `hermes chat` child: anchors file + terminal tools."""
+ROLE_ENV = "HPR_HERMES_ROLE"
+ORCHESTRATOR_ROLE = "orchestrator"
+
+
+def chat_env(workdir: Path, role: str) -> dict[str, str]:
+    """Environment for a `hermes chat` child.
+
+    TERMINAL_CWD anchors Hermes' file + terminal tools to the vault.
+    HPR_HERMES_ROLE tells the hpr CLI who is calling, so the orchestrator
+    can be refused the work it must delegate (see guard_orchestrator_fetch).
+    """
     env = dict(os.environ)
     env["TERMINAL_CWD"] = str(Path(workdir).resolve())
+    env[ROLE_ENV] = role
     return env
+
+
+def guard_orchestrator_fetch(json_output: bool = False) -> None:
+    """Refuse `hpr fetch` / `fetch-batch` when called by the orchestrator.
+
+    Fetching in the orchestrator's own session runs it on the orchestrator's
+    model and grows its context with every page, which every later turn then
+    re-reads. Measured on the first light run: ~16M tokens, nearly all of it
+    this. Fetchers run on the bulk tier in their own short sessions.
+    """
+    if os.environ.get(ROLE_ENV) != ORCHESTRATOR_ROLE:
+        return
+    import json as _json
+
+    import typer
+
+    msg = (
+        "The orchestrator does not fetch. Write the URL batch to a message file and "
+        "spawn fetchers: `hpr hermes spawn --tag <vault_tag> "
+        "--job hyperresearch-fetcher=<msg-file> ...`"
+    )
+    if json_output:
+        print(_json.dumps({"ok": False, "error": {"code": "DELEGATE_FETCH", "message": msg}}))
+    else:
+        print(f"Error: {msg}", file=sys.stderr)
+    raise typer.Exit(2)
 
 
 def load_agent(vault_root: Path, agent: str) -> tuple[dict, str]:
@@ -560,7 +606,7 @@ def run_batch(vault_root: Path, batch_id: str) -> None:
             )
             log = open(vault_root / job["log_file"], "w", encoding="utf-8")  # noqa: SIM115
             proc = subprocess.Popen(
-                cmd, cwd=vault_root, env=chat_env(vault_root), stdout=log, stderr=subprocess.STDOUT,
+                cmd, cwd=vault_root, env=chat_env(vault_root, job["agent"]), stdout=log, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, start_new_session=True,
             )
             job.update(status="running", pid=proc.pid, started=_now())

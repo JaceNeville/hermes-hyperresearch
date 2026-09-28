@@ -231,6 +231,12 @@ def get_provider(
         except ImportError:
             raise ImportError('parallel provider requires: pip install "hyperresearch[parallel]"')
 
+    if name == "remote":
+        # Fork addition: headless browser on another host over SSH.
+        from hyperresearch.web.remote_provider import RemoteBrowserProvider
+
+        return RemoteBrowserProvider(settings=settings, gates=gates)
+
     if name == "serply":
         from hyperresearch.web.serply_provider import SerplyProvider
 
@@ -238,5 +244,5 @@ def get_provider(
 
     raise ValueError(
         f"Unknown web provider: {name!r}. "
-        "Available: builtin, crawl4ai, exa, tavily, parallel, serply"
+        "Available: builtin, crawl4ai, exa, tavily, parallel, serply, remote"
     )

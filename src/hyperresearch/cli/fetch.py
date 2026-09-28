@@ -226,6 +226,9 @@ def fetch(
     json_output: bool = typer.Option(False, "--json", "-j", help="JSON output"),
 ) -> None:
     """Fetch a URL and save its content as a research note."""
+    from hyperresearch.core.hermes import guard_orchestrator_fetch
+
+    guard_orchestrator_fetch(json_output)
     from hyperresearch.core.note import write_note
     from hyperresearch.core.sync import compute_sync_plan, execute_sync
     from hyperresearch.core.vault import Vault, VaultError

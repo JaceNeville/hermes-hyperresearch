@@ -131,7 +131,9 @@ def test_chat_cmd_shape(monkeypatch, tmp_path: Path):
     assert "--in" not in cmd
     cmd = hermes.build_chat_cmd(cfg.tier("bulk"), ["file"], tmp_path / "q.md", cfg, workdir=tmp_path)
     assert cmd[cmd.index("--in") + 1] == str(tmp_path.resolve())
-    assert hermes.chat_env(tmp_path)["TERMINAL_CWD"] == str(tmp_path.resolve())
+    env = hermes.chat_env(tmp_path, "orchestrator")
+    assert env["TERMINAL_CWD"] == str(tmp_path.resolve())
+    assert env[hermes.ROLE_ENV] == "orchestrator"
 
 
 def test_spawn_batch_end_to_end_with_fake_hermes(hvault: Path, monkeypatch, tmp_path: Path):
@@ -180,3 +182,27 @@ def test_orchestrator_prompt_tier_cap():
     assert "What is X?" in p
     assert "--budget" not in p
     assert "--budget 5.0" in hermes.orchestrator_prompt("q", "full", 5.0, "/opt/hpr")
+
+
+def test_orchestrator_cannot_fetch(hvault: Path, monkeypatch):
+    """The handoff is enforced: the orchestrator's `hpr fetch` is refused."""
+    import os
+
+    from typer.testing import CliRunner
+
+    from hyperresearch.cli import app
+
+    monkeypatch.chdir(hvault)
+    runner = CliRunner()
+    env = {**os.environ, hermes.ROLE_ENV: hermes.ORCHESTRATOR_ROLE}
+    for args in (["fetch", "https://example.com", "-j"], ["fetch-batch", "https://example.com", "-j"]):
+        r = runner.invoke(app, args, env=env)
+        assert r.exit_code == 2, (args, r.output)
+        assert "DELEGATE_FETCH" in r.output
+
+
+def test_fetcher_role_is_not_blocked(monkeypatch):
+    monkeypatch.setenv(hermes.ROLE_ENV, "hyperresearch-fetcher")
+    hermes.guard_orchestrator_fetch(json_output=True)  # no exception
+    monkeypatch.delenv(hermes.ROLE_ENV)
+    hermes.guard_orchestrator_fetch(json_output=True)

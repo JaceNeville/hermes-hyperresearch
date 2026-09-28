@@ -23,6 +23,9 @@ def fetch_batch(
     json_output: bool = typer.Option(False, "--json", "-j", help="JSON output"),
 ) -> None:
     """Fetch multiple URLs and save each as a research note. Batched sync for speed."""
+    from hyperresearch.core.hermes import guard_orchestrator_fetch
+
+    guard_orchestrator_fetch(json_output)
     from hyperresearch.core.enrich import enrich_note_file
     from hyperresearch.core.note import write_note
     from hyperresearch.core.oa import (

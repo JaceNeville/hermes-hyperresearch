@@ -252,7 +252,7 @@ def run(
         if not json_output:
             console.print(f"[dim]orchestrator attempt {attempt} ({orch.model}) -> {log_path.relative_to(vault.root)}[/]")
         with open(log_path, "w", encoding="utf-8") as log:
-            code = subprocess.call(cmd, cwd=vault.root, env=hermes.chat_env(vault.root), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            code = subprocess.call(cmd, cwd=vault.root, env=hermes.chat_env(vault.root, hermes.ORCHESTRATOR_ROLE), stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         session = _session_id(log_path) or session
         run_info = _newest_run(vault, started)
         status = run_info["manifest"]["status"] if run_info else None
