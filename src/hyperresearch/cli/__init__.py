@@ -139,6 +139,11 @@ from hyperresearch.cli.scholar_cmd import app as scholar_app
 from hyperresearch.cli.sources import app as sources_app
 
 app.add_typer(profile_app, name="profile", help="Pipeline profiles (scale parameters).")
+
+# Fork addition: run the pipeline on Hermes Agent.
+from hyperresearch.cli.hermes_cmd import app as hermes_app
+
+app.add_typer(hermes_app, name="hermes", help="Run the pipeline on Hermes Agent.")
 app.add_typer(claims_app, name="claims", help="Fetcher-extracted claims (ingest + query).")
 app.add_typer(embed_app, name="embed", help="Semantic-search embeddings.")
 app.add_typer(run_app, name="run", help="Per-run workspaces + manifest (init/status/resume).")

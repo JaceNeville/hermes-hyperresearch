@@ -151,10 +151,20 @@ def profile_use(
     from hyperresearch.core.hooks import install_hooks, installed_platforms
 
     hpr_path = _resolve_executable()
-    actions = install_hooks(vault.root, hpr_path=hpr_path, profile=name)
+    from hyperresearch.core import hermes as _hermes
+    from hyperresearch.core.hooks import install_hermes
+
+    installed = installed_platforms(vault.root)
+    hermes_installed = _hermes.is_installed(vault.root)
+    actions = []
+    # Fork: a Hermes-only project must not sprout a .claude/ install here.
+    if "claude" in installed or not (installed or hermes_installed):
+        actions += install_hooks(vault.root, hpr_path=hpr_path, profile=name)
     # A project also installed for Codex gets its Codex files re-rendered too.
-    if "codex" in installed_platforms(vault.root):
+    if "codex" in installed:
         actions += install_hooks(vault.root, hpr_path=hpr_path, profile=name, platform="codex")
+    if hermes_installed:
+        actions += install_hermes(vault.root, hpr_path=hpr_path, profile=name)
 
     data = {
         "gear": name,

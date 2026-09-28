@@ -3839,6 +3839,11 @@ def _write_agent_file(
     `filename` is the Claude name (`hyperresearch-X.md`); under a Codex render
     state the agent is translated to `.codex/agents/hyperresearch-X.toml`.
     """
+    if _get_render_state().get("target") == "hermes":
+        from hyperresearch.core import hermes
+
+        rendered = _render_installed(content, header=False)
+        return hermes.write_agent(vault_root, filename, content, rendered, label)
     if _platform() == "codex":
         return _write_codex_agent_file(vault_root, filename, content, label)
 
@@ -4543,3 +4548,52 @@ def installed_platforms(root: Path) -> list[str]:
         for platform in PLATFORMS
         if (root / paths_for(platform).skills_dir / "hyperresearch" / "SKILL.md").is_file()
     ]
+
+
+# ---------------------------------------------------------------------------
+# Hermes Agent install (fork addition — see core/hermes.py)
+# ---------------------------------------------------------------------------
+
+
+def install_hermes(
+    vault_root: Path, hpr_path: str = "hyperresearch", profile: str = "full"
+) -> list[str]:
+    """Install the pipeline for Hermes Agent under .hyperresearch/hermes/.
+
+    Prompts are rendered with upstream's Codex branch, then translated to
+    Hermes vocabulary (core/hermes.translate). Nothing is written outside
+    .hyperresearch/, so a Hermes install never collides with a Claude Code or
+    Codex install in the same project.
+    """
+    global _RENDER_STATE
+    from hyperresearch.core import hermes
+
+    config_path = vault_root / ".hyperresearch" / "config.toml"
+    _set_render_state(profile, config_path if config_path.exists() else None, "codex")
+    assert _RENDER_STATE is not None
+    _RENDER_STATE["target"] = "hermes"
+    try:
+        actions: list[str] = []
+        if hermes.ensure_config(vault_root):
+            actions.append(f"Hermes: {hermes.CONFIG_FILE} (model tiers, defaults written)")
+        entry = _read_skill_source("hyperresearch.md")
+        if entry is not None:
+            r = hermes.write_entry_skill(
+                vault_root, _render_installed(entry, hpr_path, header=False), hpr_path
+            )
+            if r:
+                actions.append(r)
+        steps = {}
+        for name in _HYPERRESEARCH_STEP_SKILLS:
+            src = _read_skill_source(f"{name}.md")
+            if src is not None:
+                steps[name] = _render_installed(src, hpr_path)
+        r = hermes.write_step_files(vault_root, steps)
+        if r:
+            actions.append(r)
+        actions += _run_installers(
+            [(lambda fn=fn: fn(vault_root, hpr_path)) for fn in _agent_installers("codex")]
+        )
+        return actions
+    finally:
+        _RENDER_STATE = None
