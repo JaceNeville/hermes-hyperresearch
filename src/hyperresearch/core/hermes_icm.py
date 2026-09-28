@@ -422,11 +422,9 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
     for rnd in range(3):
         _hpr_json(hpr, ["sources", "retractions", "--tag", tag], vault_root)
         gate = _hpr_json(hpr, ["run", "finish", tag], vault_root)
-        data = gate.get("data") or {}
-        passed = bool(data.get("passed") or (data.get("verify") or {}).get("passed"))
-        if passed:
+        if _gate_passed(gate):
             break
-        failed = data.get("failed_checks") or (data.get("verify") or {}).get("failed_checks") or gate.get("error")
+        failed = _gate_failures(gate)
         echo(f"  gate round {rnd + 1}: failed {failed}")
         gdir = stages_dir / "99_gate-fix"
         gdir.mkdir(exist_ok=True)
@@ -454,6 +452,21 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
     return _summary(vault_root, tag, tier, results, gate, hpr)
 
 
+def _gate_passed(gate: dict | None) -> bool:
+    data = (gate or {}).get("data") or {}
+    return bool(data.get("passed") or (data.get("verify") or {}).get("passed"))
+
+
+def _gate_failures(gate: dict | None) -> object:
+    data = (gate or {}).get("data") or {}
+    return (
+        data.get("failed_checks")
+        or (data.get("verify") or {}).get("failed_checks")
+        or [c for c in (data.get("verify") or {}).get("checks", []) if not c.get("ok")]
+        or (gate or {}).get("error")
+    )
+
+
 def _summary(vault_root: Path, tag: str, tier: str, results: list[StageResult], gate: dict | None, hpr: str) -> dict:
     report = vault_root / REPORT.format(tag=tag)
     esc = _hpr_json(hpr, ["escalation", "list", "--status", "queued", "--tag", tag], vault_root)
@@ -465,7 +478,7 @@ def _summary(vault_root: Path, tag: str, tier: str, results: list[StageResult], 
              "minutes": round(r.duration_s / 60, 1), "tokens": r.tokens}
             for r in results
         ],
-        "gate_passed": bool(gate and (gate.get("data") or {}).get("passed")),
+        "gate_passed": _gate_passed(gate),
         "report": str(report) if report.exists() else None,
         "queued_escalations": (esc.get("data") if esc.get("ok") else None),
     }

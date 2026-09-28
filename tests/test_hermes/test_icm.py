@@ -147,3 +147,11 @@ def test_init_refused_when_pinned(hvault: Path, monkeypatch, tmp_path_factory):
     r = CliRunner().invoke(app, ["init", "."])
     assert r.exit_code == 2
     assert not (d / ".hyperresearch").exists()
+
+
+def test_gate_readout_matches_run_finish_shape():
+    ok = {"ok": True, "data": {"manifest": {}, "verify": {"passed": True, "checks": []}}}
+    bad = {"ok": True, "data": {"verify": {"passed": False, "checks": [{"name": "x", "ok": False}]}}}
+    assert hermes_icm._gate_passed(ok)
+    assert not hermes_icm._gate_passed(bad)
+    assert hermes_icm._gate_failures(bad) == [{"name": "x", "ok": False}]
