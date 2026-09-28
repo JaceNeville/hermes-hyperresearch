@@ -20,6 +20,13 @@ def init(
     json_output: bool = typer.Option(False, "--json", "-j", help="JSON output"),
 ) -> None:
     """Initialize a new hyperresearch vault (Claude Code integration)."""
+    import os as _os
+
+    if _os.environ.get("HPR_VAULT_ROOT"):
+        # Fork: Hermes subagents are pinned to one vault; `init` from inside a
+        # job created stray vaults in parent directories.
+        console.print("[red]Error:[/] init is disabled inside a Hermes research job (HPR_VAULT_ROOT is set)")
+        raise typer.Exit(2)
     from hyperresearch.core.vault import Vault, VaultError
 
     try:

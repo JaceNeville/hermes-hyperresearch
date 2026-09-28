@@ -197,7 +197,20 @@ class Vault:
 
     @staticmethod
     def discover(start: Path | None = None) -> Vault:
-        """Walk up from start (default: cwd) to find a vault root."""
+        """Walk up from start (default: cwd) to find a vault root.
+
+        Fork addition: HPR_VAULT_ROOT pins discovery to one vault when no
+        explicit start is given. Hermes subagents run with it set, so a stray
+        `cd` in an agent's shell can't create or write to a different vault.
+        """
+        import os
+
+        pinned = os.environ.get("HPR_VAULT_ROOT")
+        if start is None and pinned:
+            root = Path(pinned).resolve()
+            if (root / HYPERRESEARCH_DIR).is_dir():
+                return Vault(root)
+            raise VaultError(f"HPR_VAULT_ROOT={pinned} is not a hyperresearch vault")
         current = (start or Path.cwd()).resolve()
         while True:
             if (current / HYPERRESEARCH_DIR).is_dir():

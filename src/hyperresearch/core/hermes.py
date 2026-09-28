@@ -67,8 +67,13 @@ DEFAULT_CONFIG_TOML = """\
 default_tier = "light"
 # Tier the orchestrator (the process that sequences the steps) runs on.
 orchestrator_tier = "analysis"
-# Concurrent subagent processes. Each `hermes chat` is ~200 MB RSS.
-max_parallel = 3
+# Concurrent subagent processes, memory-aware: a new one starts only while
+# MemAvailable stays above reserve_mb + per_agent_mb. Each `hermes chat` is
+# ~220 MB RSS; the reserve protects the rest of the host (gateway, OS).
+max_parallel = 6
+min_parallel = 1
+per_agent_mb = 260
+reserve_mb = 700
 # Hard wall-clock cap per subagent, seconds.
 spawn_timeout_s = 1800
 # Tool-call iteration cap per subagent.
@@ -88,6 +93,15 @@ model = "claude-sonnet-5"
 [hermes.tiers.synthesis]
 provider = "anthropic"
 model = "claude-opus-5-5"
+
+# ICM mode (`hpr hermes icm`): pipeline step -> tier for that stage's session.
+# Steps not listed use orchestrator_tier.
+[hermes.stages]
+"1" = "analysis"
+"2" = "analysis"
+"10" = "synthesis"
+"15" = "analysis"
+"16" = "analysis"
 
 # Role -> tier. Roles match upstream's ModelMap keys.
 [hermes.roles]
@@ -123,12 +137,16 @@ class Tier:
 class HermesConfig:
     default_tier: str = "light"
     orchestrator_tier: str = "analysis"
-    max_parallel: int = 3
+    max_parallel: int = 6
+    min_parallel: int = 1
+    per_agent_mb: int = 260
+    reserve_mb: int = 700
     spawn_timeout_s: int = 1800
     max_turns: int = 120
     extra_args: list[str] = field(default_factory=list)
     tiers: dict[str, Tier] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
+    stages: dict[str, str] = field(default_factory=dict)
 
     def tier_for_role(self, role: str | None) -> Tier:
         name = self.roles.get(role or "", "analysis")
@@ -156,15 +174,19 @@ def load_config(vault_root: Path) -> HermesConfig:
         default_tier=data.get("default_tier", defaults["default_tier"]),
         orchestrator_tier=data.get("orchestrator_tier", defaults["orchestrator_tier"]),
         max_parallel=int(data.get("max_parallel", defaults["max_parallel"])),
+        min_parallel=int(data.get("min_parallel", defaults["min_parallel"])),
+        per_agent_mb=int(data.get("per_agent_mb", defaults["per_agent_mb"])),
+        reserve_mb=int(data.get("reserve_mb", defaults["reserve_mb"])),
         spawn_timeout_s=int(data.get("spawn_timeout_s", defaults["spawn_timeout_s"])),
         max_turns=int(data.get("max_turns", defaults["max_turns"])),
         extra_args=list(data.get("extra_args", defaults["extra_args"])),
         tiers=tiers,
         roles={**defaults["roles"], **data.get("roles", {})},
+        stages={**defaults["stages"], **data.get("stages", {})},
     )
     if cfg.default_tier not in ("light", "full", "auto"):
         raise HermesError("default_tier must be light, full, or auto")
-    for tier in cfg.roles.values():
+    for tier in [*cfg.roles.values(), *cfg.stages.values()]:
         cfg.tier(tier)  # raises on a dangling tier name
     cfg.tier(cfg.orchestrator_tier)
     if cfg.max_parallel < 1:
@@ -238,7 +260,7 @@ The procedure below was written for another runtime. Map it as follows:
 
 - **Read a file / step file** -> `read_file` (page through long files; read step files IN FULL).
 - **Write / patch a file** -> `write_file` for new files, `patch` for surgical edits.
-- **Shell** -> `terminal`. Always pass `timeout=600` for `hpr hermes spawn` and `hpr hermes wait`.
+- **Shell** -> `terminal`.
 - **Plan** -> the `todo` tool.
 - **Web search** -> `web_search`, for planning only.
 
@@ -265,9 +287,9 @@ ALL the subagents a step calls for in ONE command:
   --job hyperresearch-fetcher=research/runs/<vault_tag>/temp/spawn/fetcher-2.md -j
 ```
 
-The command runs up to the configured parallel limit and blocks up to ~9 minutes.
-If it returns `"status": "running"`, call `{hpr} hermes wait <batch_id> -j` (again with
-`timeout=600`) until `"status": "done"`. Each job's result carries its exit code, the
+The command runs as many jobs in parallel as memory allows and returns within
+~150 seconds. If it returns `"status": "running"`, call `{hpr} hermes wait <batch_id> -j`
+until `"status": "done"`. The batch keeps running between calls. Each job's result carries its exit code, the
 tail of its final message, and a log path. A failed job is re-spawned once; after that,
 note the gap and continue.
 
@@ -302,6 +324,10 @@ def _agent_notes(tools: list[str]) -> str:
     if "WebSearch" in have:
         lines.append("- **WebSearch** -> `web_search`. Fetch pages ONLY with the hyperresearch CLI `fetch`.")
     lines.append("- **Task** / **Skill** tools do not exist. You cannot spawn subagents.")
+    lines.append(
+        "- Your working directory is already the research vault. Don't `cd` elsewhere and "
+        "never run `init`; the hyperresearch CLI is pinned to this vault."
+    )
     if "Task" in have:
         lines.append(
             "- Wherever the instructions tell you to delegate fetching to fetcher "
@@ -421,7 +447,7 @@ def is_installed(vault_root: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def hermes_bin() -> str:
-    exe = shutil.which("hermes")
+    exe = os.environ.get("HPR_HERMES_BIN") or shutil.which("hermes")
     if not exe:
         raise HermesError("`hermes` not found on PATH")
     return exe
@@ -467,6 +493,7 @@ def chat_env(workdir: Path, role: str) -> dict[str, str]:
     """
     env = dict(os.environ)
     env["TERMINAL_CWD"] = str(Path(workdir).resolve())
+    env["HPR_VAULT_ROOT"] = str(Path(workdir).resolve())
     env[ROLE_ENV] = role
     return env
 
@@ -586,6 +613,35 @@ def _parse_result(log_path: Path) -> dict:
     return result
 
 
+def mem_available_mb() -> int | None:
+    """MemAvailable from /proc/meminfo, in MB (None where unavailable)."""
+    try:
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:
+        return None
+    return None
+
+
+def can_start(running: int, cfg: HermesConfig, avail_mb: int | None) -> bool:
+    """Start another subagent now? Pure; unit-tested.
+
+    Always allows min_parallel; never exceeds max_parallel; in between,
+    requires room for one more agent on top of the reserve. Memory of agents
+    that just started isn't in MemAvailable yet, so the caller waits a few
+    seconds between starts.
+    """
+    if running < cfg.min_parallel:
+        return True
+    if running >= cfg.max_parallel:
+        return False
+    if avail_mb is None:
+        return running < 3
+    return avail_mb >= cfg.reserve_mb + cfg.per_agent_mb
+
+
 def run_batch(vault_root: Path, batch_id: str) -> None:
     """Supervisor loop: run a batch's jobs with the parallel cap. Runs detached."""
     cfg = load_config(vault_root)
@@ -596,8 +652,14 @@ def run_batch(vault_root: Path, batch_id: str) -> None:
 
     running: dict[int, tuple[subprocess.Popen, float, IO[str]]] = {}
     queue = [j["index"] for j in batch["jobs"] if j["status"] == "queued"]
+    last_start = 0.0
     while queue or running:
-        while queue and len(running) < cfg.max_parallel:
+        while (
+            queue
+            and can_start(len(running), cfg, mem_available_mb())
+            and (len(running) < cfg.min_parallel or time.monotonic() - last_start > 8)
+        ):
+            last_start = time.monotonic()
             idx = queue.pop(0)
             job = batch["jobs"][idx]
             tier = Tier(provider=job["provider"], model=job["model"])
@@ -611,6 +673,7 @@ def run_batch(vault_root: Path, batch_id: str) -> None:
             )
             job.update(status="running", pid=proc.pid, started=_now())
             running[idx] = (proc, time.monotonic(), log)
+            batch["peak_parallel"] = max(batch.get("peak_parallel", 0), len(running))
             _save_batch(vault_root, batch)
         time.sleep(2)
         for idx, (proc, started, log) in list(running.items()):
@@ -658,15 +721,32 @@ def _ledger(vault_root: Path, batch: dict, job: dict) -> None:
         f.write(json.dumps(row) + "\n")
 
 
-def start_batch_detached(vault_root: Path, batch_id: str) -> int:
-    """Launch the supervisor in its own session so it outlives this CLI call."""
-    log = open(_batch_dir(vault_root, batch_id) / "supervisor.log", "w", encoding="utf-8")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "hyperresearch.core.hermes", "supervise", str(vault_root), batch_id],
-        cwd=vault_root, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    return proc.pid
+def start_batch_detached(vault_root: Path, batch_id: str) -> None:
+    """Launch the supervisor fully detached so it outlives this CLI call.
+
+    Double fork: the supervisor is re-parented to init at once, so it is not a
+    descendant of the caller. Agent terminal tools kill a timed-out command's
+    whole process tree; a merely setsid'd child is still in that tree and died
+    with it (observed: a 180 s tool timeout killed a running fetcher batch).
+    """
+    log_path = _batch_dir(vault_root, batch_id) / "supervisor.log"
+    argv = [sys.executable, "-m", "hyperresearch.core.hermes", "supervise", str(vault_root), batch_id]
+    pid = os.fork()
+    if pid == 0:  # intermediate child
+        try:
+            os.setsid()
+            if os.fork() > 0:
+                os._exit(0)
+            os.chdir(vault_root)
+            fd_in = os.open(os.devnull, os.O_RDONLY)
+            fd_out = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            os.dup2(fd_in, 0)
+            os.dup2(fd_out, 1)
+            os.dup2(fd_out, 2)
+            os.execv(sys.executable, argv)
+        finally:
+            os._exit(1)
+    os.waitpid(pid, 0)
 
 
 def wait_batch(vault_root: Path, batch_id: str, timeout_s: int) -> dict:
@@ -704,7 +784,13 @@ def summarize(batch: dict) -> dict:
     counts: dict[str, int] = {}
     for j in batch["jobs"]:
         counts[j["status"]] = counts.get(j["status"], 0) + 1
-    return {"batch_id": batch["batch_id"], "status": batch["status"], "counts": counts, "jobs": jobs}
+    return {
+        "batch_id": batch["batch_id"],
+        "status": batch["status"],
+        "counts": counts,
+        "peak_parallel": batch.get("peak_parallel"),
+        "jobs": jobs,
+    }
 
 
 # ---------------------------------------------------------------------------

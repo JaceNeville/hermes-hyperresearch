@@ -23,8 +23,9 @@ from hyperresearch.models.output import error, success
 
 app = typer.Typer(no_args_is_help=True)
 
-# Stay under the Hermes terminal tool's 600 s foreground cap.
-WAIT_CAP_S = 540
+# Stay under the Hermes terminal tool's default 180 s foreground timeout, so a
+# wait never gets its command killed. The batch runs on regardless.
+WAIT_CAP_S = 150
 
 
 def _fail(msg: str, code: str, json_output: bool) -> NoReturn:
@@ -167,7 +168,7 @@ def _emit_batch(summary: dict, vault, json_output: bool) -> None:
     if json_output:
         output(success(summary, vault=str(vault.root)), json_mode=True)
         return
-    console.print(f"batch {summary['batch_id']}: [bold]{summary['status']}[/] {summary['counts']}")
+    console.print(f"batch {summary['batch_id']}: [bold]{summary['status']}[/] {summary['counts']} peak parallel {summary.get('peak_parallel')}")
     for j in summary["jobs"]:
         console.print(f"  [{j['index']}] {j['agent']} ({j['model']}): {j['status']}")
     if summary["status"] != "done":
@@ -196,6 +197,43 @@ def _session_id(log_path: Path) -> str | None:
     from hyperresearch.core.hermes import _parse_result
 
     return _parse_result(log_path).get("session_id")
+
+
+@app.command("icm")
+def icm(
+    query: str = typer.Argument(None, help="Research query (or use --query-file)."),
+    query_file: Path | None = typer.Option(None, "--query-file", help="Read the query from a file."),
+    tier: str | None = typer.Option(None, "--tier", help="light | full | auto (default: hermes.toml default_tier)."),
+    json_output: bool = typer.Option(False, "--json", "-j"),
+) -> None:
+    """Run the pipeline ICM-style: code sequences stages, each a fresh session."""
+    from hyperresearch.core import hermes, hermes_icm
+    from hyperresearch.core.agent_docs import _resolve_executable
+
+    vault = _vault(json_output)
+    if not hermes.is_installed(vault.root):
+        _fail("not installed for Hermes; run `hpr hermes install` first", "NOT_INSTALLED", json_output)
+    if query_file:
+        query = query_file.read_text(encoding="utf-8")
+    if not query or not query.strip():
+        _fail("empty research query", "NO_QUERY", json_output)
+    try:
+        cfg = hermes.load_config(vault.root)
+        tier_cap = tier or cfg.default_tier
+        if tier_cap not in ("light", "full", "auto"):
+            _fail("--tier must be light, full, or auto", "BAD_TIER", json_output)
+        echo = (lambda *_: None) if json_output else (lambda m: console.print(m))
+        data = hermes_icm.run_icm(vault.root, query, tier_cap, _resolve_executable(), echo=echo)
+    except hermes.HermesError as e:
+        _fail(str(e), "ICM_ERROR", json_output)
+    data["spend"] = _spawn_spend(vault.root, data["vault_tag"])
+    ok = data["gate_passed"]
+    if json_output:
+        output(success(data, vault=str(vault.root)) if ok else error(json.dumps(data), "RUN_NOT_DONE"), json_mode=True)
+    else:
+        console.print(json.dumps(data, indent=2))
+    if not ok:
+        raise typer.Exit(1)
 
 
 @app.command("run")

@@ -1,0 +1,471 @@
+"""ICM mode: each pipeline step runs as its own stage, sequenced by code.
+
+    hpr hermes icm "QUERY" [--tier light|full|auto]
+
+Why: in single-session mode the orchestrator carries every step's procedure,
+tool output, and subagent report in one ever-growing context, and every turn
+re-reads all of it. Measured on the light benchmark: ~120k tokens per turn on
+average, ~12-16M tokens per run, almost all of it re-reading.
+
+ICM (stage folders + load lists + file handoffs) fixes that structurally:
+
+* **Code sequences, models work.** A Python loop walks the tier's steps. No
+  model is paid to remember where the run is.
+* **One fresh session per stage.** Each stage starts empty, reads only what
+  its load list names, writes its outputs to disk, and exits.
+* **Per-run structure, built programmatically.** Every run gets its own
+  `research/runs/<tag>/stages/NN_name/` tree with a generated CONTEXT.md
+  (the stage contract), the session log, and a handoff note. Nothing is
+  shared between runs except the source library, so folders can't drift.
+* **Code checks each stage's outputs** before moving on, resumes the stage
+  once if something is missing, and runs the ship gate itself.
+
+Upstream step files are used unchanged: a stage's CONTEXT.md points at the
+step file and overrides only the "return to the orchestrator" plumbing.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+
+from hyperresearch.core import hermes
+
+# ---------------------------------------------------------------------------
+# Stage catalogue
+# ---------------------------------------------------------------------------
+
+TIER_STEPS = {
+    "light": ["1", "2", "10", "15", "16"],
+    "full": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "14.5", "15", "16"],
+}
+
+STEP_FILES = {
+    "1": "hyperresearch-1-decompose",
+    "2": "hyperresearch-2-width-sweep",
+    "3": "hyperresearch-3-contradiction-graph",
+    "4": "hyperresearch-4-loci-analysis",
+    "5": "hyperresearch-5-depth-investigation",
+    "6": "hyperresearch-6-cross-locus-reconcile",
+    "7": "hyperresearch-7-source-tensions",
+    "8": "hyperresearch-8-corpus-critic",
+    "9": "hyperresearch-9-evidence-digest",
+    "10": "hyperresearch-10-triple-draft",
+    "11": "hyperresearch-11-synthesize",
+    "12": "hyperresearch-12-critics",
+    "13": "hyperresearch-13-gap-fetch",
+    "14": "hyperresearch-14-patcher",
+    "14.5": "hyperresearch-14-5-cite-check",
+    "15": "hyperresearch-15-polish",
+    "16": "hyperresearch-16-readability-audit",
+}
+
+R = "research/runs/{tag}"
+REPORT = "research/notes/final_report_{tag}.md"
+
+
+@dataclass
+class Stage:
+    step: str
+    title: str
+    loads: list[str]
+    outputs: list[str]  # paths code checks; "@notes" = >=1 vault note tagged with the run
+    web: bool = False
+    extra: str = ""
+    avoid: list[str] = field(default_factory=list)
+
+
+_SHIMS = R + "/shims/"
+_BASE = [R + "/query.md", R + "/scaffold.md", R + "/prompt-decomposition.json"]
+
+STAGES: dict[str, Stage] = {
+    "1": Stage(
+        "1", "decompose",
+        loads=[R + "/query.md"],
+        outputs=[R + "/scaffold.md", R + "/prompt-decomposition.json", R + "/temp/coverage-matrix.md", _SHIMS],
+        extra="@bootstrap",
+    ),
+    "2": Stage(
+        "2", "width-sweep",
+        loads=[*_BASE, R + "/temp/coverage-matrix.md", _SHIMS + "research.md"],
+        outputs=["@notes"],
+        web=True,
+        avoid=["full text of fetched source notes (research/notes/*.md) — use `note list` and the fetchers' handoffs"],
+        extra=(
+            "**Fetcher batching (this runtime):** give each `hyperresearch-fetcher` at most **5 URLs**, "
+            "and launch every fetcher of a wave in **one** `hpr hermes spawn` call. The spawner runs "
+            "as many in parallel as memory allows; short batches keep each fetcher's session short, "
+            "which is where fetch cost comes from. On light tier that is typically 4-5 fetchers in wave 1."
+        ),
+    ),
+    "3": Stage("3", "contradiction-graph", loads=[*_BASE], outputs=[R + "/temp/contradiction-graph.json"]),
+    "4": Stage("4", "loci-analysis", loads=[*_BASE, R + "/temp/contradiction-graph.json"], outputs=[R + "/loci.json"]),
+    "5": Stage("5", "depth-investigation", loads=[*_BASE, R + "/loci.json"], outputs=["@interim"], web=True),
+    "6": Stage("6", "cross-locus-reconcile", loads=[*_BASE, R + "/loci.json"], outputs=[R + "/comparisons.md"]),
+    "7": Stage("7", "source-tensions", loads=[*_BASE], outputs=[R + "/temp/source-tensions.json"]),
+    "8": Stage("8", "corpus-critic", loads=[*_BASE], outputs=[R + "/corpus-critic-gaps.json"], web=True),
+    "9": Stage("9", "evidence-digest", loads=[*_BASE], outputs=[R + "/temp/evidence-digest.md"]),
+    "10": Stage(
+        "10", "draft",
+        loads=[*_BASE, _SHIMS + "drafting.md", "the 8-15 most relevant source notes (via `note show`)"],
+        outputs=["@draft"],
+    ),
+    "11": Stage("11", "synthesize", loads=[*_BASE, R + "/temp/draft-a.md", R + "/temp/draft-b.md", R + "/temp/draft-c.md"], outputs=[REPORT]),
+    "12": Stage("12", "critics", loads=[*_BASE, REPORT], outputs=[R + "/critic-findings-width.json"]),
+    "13": Stage("13", "gap-fetch", loads=[*_BASE, R + "/critic-findings-width.json"], outputs=[R + "/temp/post-critic-fetch-log.md"], web=True),
+    "14": Stage("14", "patcher", loads=[*_BASE, REPORT], outputs=[R + "/patch-log.json"]),
+    "14.5": Stage("14.5", "cite-check", loads=[*_BASE, REPORT], outputs=[REPORT]),
+    "15": Stage("15", "polish", loads=[R + "/query.md", REPORT, _SHIMS + "polish.md"], outputs=[R + "/polish-log.json"]),
+    "16": Stage("16", "readability-audit", loads=[R + "/query.md", REPORT], outputs=[R + "/readability-recommendations.json"]),
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_STOP = set(["a", "an", "the", "of", "to", "for", "and", "or", "in", "on", "at", "by", "with", "what", "how", "does", "do", "is", "are", "be", "as", "that", "this", "from", "vs", "versus", "which", "when", "why", "who", "whom", "current", "evidence", "say", "says", "keep", "it", "practical"])
+
+
+def slugify(query: str) -> str:
+    words = [w for w in re.findall(r"[a-z0-9]+", query.lower()) if w not in _STOP]
+    return "-".join(words[:4]) or "research"
+
+
+def _section(skill_text: str, start: str, end: str) -> str:
+    """Slice a section out of the installed entry skill, so upstream edits flow through."""
+    i = skill_text.find(start)
+    if i < 0:
+        return ""
+    j = skill_text.find(end, i + len(start))
+    return skill_text[i : j if j > 0 else None].strip()
+
+
+def _hpr_json(hpr: str, args: list[str], cwd: Path) -> dict:
+    p = subprocess.run([hpr, *args, "--json"], cwd=cwd, capture_output=True, text=True, timeout=600)
+    try:
+        return json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": {"message": (p.stdout + p.stderr)[-800:]}}
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------------------
+# Stage contract (CONTEXT.md)
+# ---------------------------------------------------------------------------
+
+
+def render_context(stage: Stage, tag: str, tier: str, query: str, hpr: str, skill_text: str, prev_handoffs: str) -> str:
+    fmt = lambda p: p.format(tag=tag)  # noqa: E731
+    loads = "\n".join(f"- `{fmt(p)}`" if "/" in p else f"- {p}" for p in stage.loads)
+    outputs = []
+    for o in stage.outputs:
+        outputs.append({
+            "@notes": f"- source notes in the vault tagged `{tag}` (fetched by fetcher subagents)",
+            "@interim": f"- interim notes (`type: interim`) tagged `{tag}`",
+            "@draft": (f"- `{fmt(REPORT)}` (light tier: single draft)" if tier == "light"
+                       else f"- `{fmt(R)}/temp/draft-{{a,b,c}}.md`"),
+        }.get(o, f"- `{fmt(o)}`"))
+    avoid = [
+        "`.hyperresearch/hermes/SKILL.md` — the orchestrator entry. Code sequences the run; you don't need it.",
+        "other steps' files under `.hyperresearch/hermes/steps/`",
+        *stage.avoid,
+    ]
+    extra = stage.extra
+    if extra == "@bootstrap":
+        extra = (
+            "**Before the procedure, finish the bootstrap** (code already minted the vault tag, "
+            "initialized the run, and wrote `query.md`). Do these two items from the entry skill:\n\n"
+            + _section(skill_text, "4. **Classify modality**", "6. **Seed your plan.**")
+        )
+    tier_rule = {
+        "light": "In this stage's procedure, set `pipeline_tier` to `\"light\"` (operator cap) and note the cap in the scaffold.",
+        "full": "In this stage's procedure, set `pipeline_tier` to `\"full\"` (operator choice).",
+        "auto": "Classify `pipeline_tier` as the procedure describes.",
+    }[tier] if stage.step == "1" else f"Tier for this run: **{tier}**. Follow the {tier}-tier branch of the procedure."
+
+    spawn_contract = _section(skill_text, "## Subagent spawn contract", "\n---")
+    return f"""# Stage {stage.step} — {stage.title}
+
+You are ONE stage of a research pipeline that code runs as separate stages (ICM).
+This session is fresh: this file is everything you know. Do this stage, then stop.
+
+## Run
+- vault_tag: `{tag}`
+- run dir: `{fmt(R)}/`
+- CLI: `{hpr}` (use this exact path)
+- {tier_rule}
+
+## Research query (verbatim — gospel)
+
+{chr(10).join('> ' + line for line in query.strip().splitlines())}
+
+## Load (only these)
+{loads}
+- the step file: `.hyperresearch/hermes/steps/{STEP_FILES[stage.step]}.md` (read IN FULL, paging as needed)
+
+## Do not load
+{chr(10).join('- ' + a for a in avoid)}
+
+## Procedure
+Follow the step file. Where it says to return to the entry skill, invoke the next step,
+or record the step with `run step`, skip that: code records progress and starts the next
+stage. Everything this stage needs from earlier stages is on disk at the paths above.
+
+{extra}
+
+## Outputs (code checks these before the next stage starts)
+{chr(10).join(outputs)}
+
+## Tools in this runtime
+- Read -> `read_file` (page long files). Write -> `write_file`. Edit -> `patch` (surgical only).
+- Shell -> `terminal`.{" Web search -> `web_search` (planning only)." if stage.web else ""}
+- You never fetch source pages yourself: `{hpr} fetch` / `fetch-batch` refuse to run here
+  (`DELEGATE_FETCH`). Fetching is the fetcher subagents' job.
+
+## Spawning subagents
+Write each subagent's full message to its own file under `{fmt(R)}/temp/spawn/`, then launch
+all of a step's subagents in ONE command:
+
+```bash
+{hpr} hermes spawn --tag {tag} --job AGENT=MSG_FILE --job AGENT=MSG_FILE -j
+```
+
+It returns within ~3 minutes. If `"status": "running"`, run `{hpr} hermes wait <batch_id> -j`
+until `"status": "done"`. Retry a failed job once; after that note the gap and continue.
+
+{spawn_contract}
+## Earlier stages' handoffs
+{prev_handoffs or "(none — this is the first stage)"}
+
+## When you're done
+Stop once the outputs exist. Your final message is this stage's handoff to the next one:
+3-6 lines on what you produced and anything the next stage must know. No report text.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class StageResult:
+    step: str
+    ok: bool
+    attempts: int
+    missing: list[str]
+    session_id: str | None
+    tokens: dict
+    duration_s: float
+
+
+def _check_outputs(vault_root: Path, stage: Stage, tag: str, tier: str, hpr: str) -> list[str]:
+    missing = []
+    for o in stage.outputs:
+        if o == "@notes":
+            d = _hpr_json(hpr, ["note", "list", "--tag", tag, "--all"], vault_root)
+            if not (d.get("ok") and d.get("data")):
+                missing.append(f"source notes tagged {tag}")
+        elif o == "@interim":
+            d = _hpr_json(hpr, ["note", "list", "--tag", tag, "--type", "interim", "--all"], vault_root)
+            if not (d.get("ok") and d.get("data")):
+                missing.append("interim notes")
+        elif o == "@draft":
+            paths = [REPORT] if tier == "light" else [R + "/temp/draft-a.md", R + "/temp/draft-b.md", R + "/temp/draft-c.md"]
+            missing += [p.format(tag=tag) for p in paths if not (vault_root / p.format(tag=tag)).exists()]
+        else:
+            p = vault_root / o.format(tag=tag)
+            if o.endswith("/"):
+                if not (p.is_dir() and any(p.iterdir())):
+                    missing.append(o.format(tag=tag))
+            elif not p.exists():
+                missing.append(o.format(tag=tag))
+    return missing
+
+
+def _run_session(
+    vault_root: Path, cfg: hermes.HermesConfig, tier_name: str, toolsets: list[str],
+    prompt_file: Path, log_file: Path, resume: str | None = None,
+) -> tuple[int, dict]:
+    tier = cfg.tier(tier_name)
+    cmd = hermes.build_chat_cmd(tier, toolsets, prompt_file, cfg, max_turns=200, workdir=vault_root)
+    if resume:
+        cmd += ["--resume", resume]
+    with open(log_file, "a", encoding="utf-8") as log:
+        code = subprocess.call(
+            cmd, cwd=vault_root, env=hermes.chat_env(vault_root, hermes.ORCHESTRATOR_ROLE),
+            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
+    return code, hermes._parse_result(log_file)
+
+
+def _ledger(vault_root: Path, tag: str, row: dict) -> None:
+    path = vault_root / R.format(tag=tag) / "temp" / "hermes-spawns.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def _write_index(vault_root: Path, tag: str, tier: str, rows: list[dict], sealed: bool) -> None:
+    lines = [
+        f"# Run {tag}",
+        "",
+        f"- tier: {tier}",
+        f"- status: {'SEALED — do not reuse this folder' if sealed else 'in progress'}",
+        f"- updated: {_now()}",
+        "",
+        "| Stage | Status | Model | Minutes | Tokens |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        lines.append(f"| {r['stage']} | {r['status']} | {r.get('model', '')} | {r.get('minutes', '')} | {r.get('tokens', '')} |")
+    (vault_root / R.format(tag=tag) / "stages" / "RUN.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> dict:
+    cfg = hermes.load_config(vault_root)
+    skill_text = (vault_root / hermes.ENTRY_SKILL).read_text(encoding="utf-8")
+
+    # --- bootstrap, in code -------------------------------------------------
+    tag = _hpr_json(hpr, ["vault-tag", slugify(query)], vault_root)["data"]["vault_tag"]
+    run_dir = vault_root / R.format(tag=tag)
+    stages_dir = run_dir / "stages"
+    stages_dir.mkdir(parents=True, exist_ok=True)
+    qfile = stages_dir / "query.txt"
+    qfile.write_text(query.strip() + "\n", encoding="utf-8")
+    init = _hpr_json(hpr, ["run", "init", tag, "--profile", "full" if tier == "full" else "light",
+                           "--query-file", str(qfile)], vault_root)
+    if not init.get("ok"):
+        raise hermes.HermesError(f"run init failed: {init.get('error')}")
+    echo(f"run {tag}: {run_dir.relative_to(vault_root)}")
+
+    steps = list(TIER_STEPS["light" if tier in ("light", "auto") else "full"])
+    rows: list[dict] = []
+    handoffs: list[str] = []
+    results: list[StageResult] = []
+    i = 0
+    while i < len(steps):
+        step = steps[i]
+        stage = STAGES[step]
+        sdir = stages_dir / f"{int(float(step)):02d}{'_5' if step.endswith('.5') else ''}_{stage.title}"
+        sdir.mkdir(exist_ok=True)
+        ctx = render_context(stage, tag, tier, query, hpr, skill_text, "\n\n".join(handoffs[-3:]))
+        (sdir / "CONTEXT.md").write_text(ctx, encoding="utf-8")
+        tier_name = cfg.stages.get(step, cfg.orchestrator_tier)
+        toolsets = ["file", "terminal"] + (["web"] if stage.web else [])
+        log = sdir / "session.log.jsonl"
+        _hpr_json(hpr, ["run", "step", tag, step, "--status", "running"], vault_root)
+        echo(f"  stage {step} {stage.title} ({cfg.tier(tier_name).model}) ...")
+        t0 = time.monotonic()
+        code, res = _run_session(vault_root, cfg, tier_name, toolsets, sdir / "CONTEXT.md", log)
+        tokens = dict(res.get("tokens") or {})
+        missing = _check_outputs(vault_root, stage, tag, tier, hpr)
+        attempts = 1
+        if missing and res.get("session_id"):
+            fix = sdir / "resume.md"
+            fix.write_text(
+                "Code checked this stage's outputs and these are missing:\n"
+                + "\n".join(f"- {m}" for m in missing)
+                + "\n\nFinish the stage so they exist, then stop with your handoff.\n",
+                encoding="utf-8",
+            )
+            code, res2 = _run_session(vault_root, cfg, tier_name, toolsets, fix, log, resume=res["session_id"])
+            for k, v in (res2.get("tokens") or {}).items():
+                tokens[k] = int(tokens.get(k) or 0) + int(v or 0)
+            res = res2 or res
+            missing = _check_outputs(vault_root, stage, tag, tier, hpr)
+            attempts = 2
+        dur = time.monotonic() - t0
+        handoff = (res.get("text") or "").strip()[-1500:]
+        (sdir / "handoff.md").write_text(handoff + "\n", encoding="utf-8")
+        handoffs.append(f"### Stage {step} — {stage.title}\n{handoff}")
+        ok = not missing
+        _ledger(vault_root, tag, {
+            "agent": f"stage-{step}-{stage.title}", "role": "stage", "tier": tier_name,
+            "model": cfg.tier(tier_name).model, "status": "done" if ok else "failed",
+            "exit_code": code, "tokens": tokens, "duration_ms": int(dur * 1000),
+        })
+        results.append(StageResult(step, ok, attempts, missing, res.get("session_id"), tokens, dur))
+        rows.append({"stage": f"{step} {stage.title}", "status": "done" if ok else f"MISSING {missing}",
+                     "model": cfg.tier(tier_name).model, "minutes": round(dur / 60, 1),
+                     "tokens": tokens.get("total")})
+        _write_index(vault_root, tag, tier, rows, sealed=False)
+        echo(f"    {'ok' if ok else 'MISSING ' + str(missing)} in {dur / 60:.1f} min, {tokens.get('total')} tokens")
+        if not ok:
+            _hpr_json(hpr, ["run", "block", tag, "--on", f"stage-{step}-outputs"], vault_root)
+            return _summary(vault_root, tag, tier, results, None, hpr)
+        _hpr_json(hpr, ["run", "step", tag, step, "--status", "done"], vault_root)
+
+        if step == "1" and tier == "auto":
+            try:
+                decomp = json.loads((run_dir / "prompt-decomposition.json").read_text())
+                chosen = decomp.get("pipeline_tier", "light")
+            except Exception:
+                chosen = "light"
+            if chosen == "full":
+                steps, tier = list(TIER_STEPS["full"]), "full"
+            else:
+                tier = "light"
+        i += 1
+
+    # --- ship gate, in code -------------------------------------------------
+    gate = None
+    for rnd in range(3):
+        _hpr_json(hpr, ["sources", "retractions", "--tag", tag], vault_root)
+        gate = _hpr_json(hpr, ["run", "finish", tag], vault_root)
+        data = gate.get("data") or {}
+        passed = bool(data.get("passed") or (data.get("verify") or {}).get("passed"))
+        if passed:
+            break
+        failed = data.get("failed_checks") or (data.get("verify") or {}).get("failed_checks") or gate.get("error")
+        echo(f"  gate round {rnd + 1}: failed {failed}")
+        gdir = stages_dir / "99_gate-fix"
+        gdir.mkdir(exist_ok=True)
+        gctx = gdir / f"CONTEXT-{rnd + 1}.md"
+        gctx.write_text(
+            f"# Gate fix — round {rnd + 1}\n\nRun `{tag}`. The ship gate failed these checks:\n\n"
+            f"```json\n{json.dumps(failed, indent=2)[:4000]}\n```\n\n"
+            f"Run `{hpr} run finish {tag} --json` to see details, fix the REPORT "
+            f"(`{REPORT.format(tag=tag)}`) with surgical `patch` edits, and stop once it passes.\n\n"
+            + _section(skill_text, "**The gate's verdict is final.", "Ship only after")
+            + "\n",
+            encoding="utf-8",
+        )
+        t0 = time.monotonic()
+        code, res = _run_session(vault_root, cfg, cfg.orchestrator_tier, ["file", "terminal"], gctx,
+                                 gdir / "session.log.jsonl")
+        _ledger(vault_root, tag, {
+            "agent": f"stage-gate-fix-{rnd + 1}", "role": "stage", "tier": cfg.orchestrator_tier,
+            "model": cfg.tier(cfg.orchestrator_tier).model, "status": "done", "exit_code": code,
+            "tokens": res.get("tokens"), "duration_ms": int((time.monotonic() - t0) * 1000),
+        })
+    status = _hpr_json(hpr, ["run", "status", tag], vault_root).get("data", {}).get("status")
+    rows.append({"stage": "ship gate", "status": status})
+    _write_index(vault_root, tag, tier, rows, sealed=status == "done")
+    return _summary(vault_root, tag, tier, results, gate, hpr)
+
+
+def _summary(vault_root: Path, tag: str, tier: str, results: list[StageResult], gate: dict | None, hpr: str) -> dict:
+    report = vault_root / REPORT.format(tag=tag)
+    esc = _hpr_json(hpr, ["escalation", "list", "--status", "queued", "--tag", tag], vault_root)
+    return {
+        "vault_tag": tag,
+        "tier": tier,
+        "stages": [
+            {"step": r.step, "ok": r.ok, "attempts": r.attempts, "missing": r.missing,
+             "minutes": round(r.duration_s / 60, 1), "tokens": r.tokens}
+            for r in results
+        ],
+        "gate_passed": bool(gate and (gate.get("data") or {}).get("passed")),
+        "report": str(report) if report.exists() else None,
+        "queued_escalations": (esc.get("data") if esc.get("ok") else None),
+    }
