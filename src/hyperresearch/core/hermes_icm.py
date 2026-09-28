@@ -81,48 +81,136 @@ class Stage:
 
 
 _SHIMS = R + "/shims/"
+_T = R + "/temp/"
 _BASE = [R + "/query.md", R + "/scaffold.md", R + "/prompt-decomposition.json"]
+_NOTES = "source notes for this run: `note list --tag {tag}` for the list, `note show <id>` only for the ones you need"
+_NO_BULK = "full bodies of every source note; read only the notes the step names"
+_CRITICS = [R + f"/critic-findings-{c}.json" for c in ("width", "depth", "instruction", "dialectic")]
+
+
+def _fetch_rule(urls: int) -> str:
+    return (
+        f"**Fetcher batching (this runtime):** give each `hyperresearch-fetcher` at most **{urls} URLs**, "
+        "and launch every fetcher of a wave in **one** `hpr hermes spawn` call. The spawner runs as many "
+        "in parallel as memory allows; short batches keep each fetcher's session short, which is where "
+        "fetch cost comes from."
+    )
+
 
 STAGES: dict[str, Stage] = {
     "1": Stage(
         "1", "decompose",
         loads=[R + "/query.md"],
-        outputs=[R + "/scaffold.md", R + "/prompt-decomposition.json", R + "/temp/coverage-matrix.md", _SHIMS],
+        outputs=[R + "/scaffold.md", R + "/prompt-decomposition.json", _T + "coverage-matrix.md", _SHIMS],
         extra="@bootstrap",
     ),
     "2": Stage(
         "2", "width-sweep",
-        loads=[*_BASE, R + "/temp/coverage-matrix.md", _SHIMS + "research.md"],
-        outputs=["@notes"],
+        loads=[*_BASE, _T + "coverage-matrix.md", _SHIMS + "research.md"],
+        outputs=["@notes", _T + "coverage-gaps.md"],
         web=True,
-        avoid=["full text of fetched source notes (research/notes/*.md) — use `note list` and the fetchers' handoffs"],
-        extra=(
-            "**Fetcher batching (this runtime):** give each `hyperresearch-fetcher` at most **5 URLs**, "
-            "and launch every fetcher of a wave in **one** `hpr hermes spawn` call. The spawner runs "
-            "as many in parallel as memory allows; short batches keep each fetcher's session short, "
-            "which is where fetch cost comes from. On light tier that is typically 4-5 fetchers in wave 1."
-        ),
+        avoid=["full text of fetched source notes (research/notes/*.md); use `note list` and the fetchers' handoffs"],
+        extra=_fetch_rule(3),
     ),
-    "3": Stage("3", "contradiction-graph", loads=[*_BASE], outputs=[R + "/temp/contradiction-graph.json"]),
-    "4": Stage("4", "loci-analysis", loads=[*_BASE, R + "/temp/contradiction-graph.json"], outputs=[R + "/loci.json"]),
-    "5": Stage("5", "depth-investigation", loads=[*_BASE, R + "/loci.json"], outputs=["@interim"], web=True),
-    "6": Stage("6", "cross-locus-reconcile", loads=[*_BASE, R + "/loci.json"], outputs=[R + "/comparisons.md"]),
-    "7": Stage("7", "source-tensions", loads=[*_BASE], outputs=[R + "/temp/source-tensions.json"]),
-    "8": Stage("8", "corpus-critic", loads=[*_BASE], outputs=[R + "/corpus-critic-gaps.json"], web=True),
-    "9": Stage("9", "evidence-digest", loads=[*_BASE], outputs=[R + "/temp/evidence-digest.md"]),
+    "3": Stage(
+        "3", "contradiction-graph",
+        loads=[*_BASE, _T + "claims-*.json"],
+        outputs=[_T + "contradiction-graph.json", _T + "consensus-claims.json"],
+        avoid=[_NO_BULK],
+    ),
+    "4": Stage(
+        "4", "loci-analysis",
+        loads=[*_BASE, _SHIMS + "research.md", _T + "coverage-gaps.md", _T + "contradiction-graph.json", _NOTES],
+        outputs=[R + "/loci.json"],
+        avoid=[_NO_BULK],
+    ),
+    "5": Stage(
+        "5", "depth-investigation",
+        loads=[*_BASE, _SHIMS + "research.md", R + "/loci.json", _T + "contradiction-graph.json"],
+        outputs=["@interim"],
+        web=True,
+        avoid=[_NO_BULK, "the investigators' fetched sources; read their interim notes only"],
+        extra=_fetch_rule(3),
+    ),
+    "6": Stage(
+        "6", "cross-locus-reconcile",
+        loads=[*_BASE, R + "/loci.json", "the interim notes (`note list --tag {tag} --type interim`)", _T + "orchestrator-notes.md"],
+        outputs=[R + "/comparisons.md"],
+        avoid=[_NO_BULK],
+    ),
+    "7": Stage(
+        "7", "source-tensions",
+        loads=[*_BASE, _T + "contradiction-graph.json", R + "/comparisons.md", _NOTES],
+        outputs=[_T + "source-tensions.json"],
+        avoid=[_NO_BULK],
+    ),
+    "8": Stage(
+        "8", "corpus-critic",
+        loads=[*_BASE, _SHIMS + "research.md", R + "/loci.json", R + "/comparisons.md", _T + "source-tensions.json"],
+        outputs=[R + "/corpus-critic-gaps.json", _T + "corpus-critic-results.md"],
+        web=True,
+        avoid=[_NO_BULK],
+        extra=_fetch_rule(3),
+    ),
+    "9": Stage(
+        "9", "evidence-digest",
+        loads=[*_BASE, _T + "claims-*.json", _T + "contradiction-graph.json", _T + "consensus-claims.json"],
+        outputs=[_T + "evidence-digest.md"],
+        avoid=[_NO_BULK],
+    ),
     "10": Stage(
         "10", "draft",
-        loads=[*_BASE, _SHIMS + "drafting.md", "the 8-15 most relevant source notes (via `note show`)"],
+        loads=[*_BASE, _SHIMS + "drafting.md", "@draft-inputs"],
         outputs=["@draft"],
     ),
-    "11": Stage("11", "synthesize", loads=[*_BASE, R + "/temp/draft-a.md", R + "/temp/draft-b.md", R + "/temp/draft-c.md"], outputs=[REPORT]),
-    "12": Stage("12", "critics", loads=[*_BASE, REPORT], outputs=[R + "/critic-findings-width.json"]),
-    "13": Stage("13", "gap-fetch", loads=[*_BASE, R + "/critic-findings-width.json"], outputs=[R + "/temp/post-critic-fetch-log.md"], web=True),
-    "14": Stage("14", "patcher", loads=[*_BASE, REPORT], outputs=[R + "/patch-log.json"]),
-    "14.5": Stage("14.5", "cite-check", loads=[*_BASE, REPORT], outputs=[REPORT]),
+    "11": Stage(
+        "11", "synthesize",
+        loads=[*_BASE, _T + "draft-a.md", _T + "draft-b.md", _T + "draft-c.md", _T + "evidence-digest.md",
+               _T + "source-tensions.json", R + "/comparisons.md"],
+        outputs=[REPORT, _T + "synthesis-pass1.md"],
+        avoid=[_NO_BULK],
+    ),
+    "12": Stage(
+        "12", "critics",
+        loads=[*_BASE, _SHIMS + "critics.md", REPORT],
+        outputs=_CRITICS,
+        avoid=[_NO_BULK],
+    ),
+    "13": Stage(
+        "13", "gap-fetch",
+        loads=[*_BASE, _SHIMS + "research.md", R + "/critic-findings-*.json", _T + "evidence-digest.md"],
+        outputs=[_T + "post-critic-fetch-log.md"],
+        web=True,
+        avoid=[_NO_BULK],
+        extra=_fetch_rule(3),
+    ),
+    "14": Stage(
+        "14", "patcher",
+        loads=[*_BASE, _SHIMS + "critics.md", REPORT, R + "/critic-findings-*.json", _T + "evidence-digest.md"],
+        outputs=[R + "/patch-log.json"],
+        avoid=[_NO_BULK],
+    ),
+    "14.5": Stage(
+        "14.5", "cite-check",
+        loads=[*_BASE, REPORT],
+        outputs=[R + "/cite-check-pairs.json", R + "/cite-check-findings.json"],
+        avoid=[_NO_BULK],
+    ),
     "15": Stage("15", "polish", loads=[R + "/query.md", REPORT, _SHIMS + "polish.md"], outputs=[R + "/polish-log.json"]),
     "16": Stage("16", "readability-audit", loads=[R + "/query.md", REPORT], outputs=[R + "/readability-recommendations.json"]),
 }
+
+_DRAFT_INPUTS = {
+    "light": ["the 8-15 most relevant source notes (via `note show`)"],
+    "full": [_T + "evidence-digest.md", _T + "source-tensions.json", R + "/comparisons.md",
+             R + "/loci.json", _T + "orchestrator-notes.md"],
+}
+
+
+def stage_tier(cfg: hermes.HermesConfig, step: str, tier: str) -> str:
+    """Tier name for a stage's own session. `[hermes.stages]` accepts
+    `"10@light"`-style keys to override one run tier."""
+    return cfg.stages.get(f"{step}@{tier}") or cfg.stages.get(step) or cfg.orchestrator_tier
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +253,10 @@ def _now() -> str:
 
 def render_context(stage: Stage, tag: str, tier: str, query: str, hpr: str, skill_text: str, prev_handoffs: str) -> str:
     fmt = lambda p: p.format(tag=tag)  # noqa: E731
-    loads = "\n".join(f"- `{fmt(p)}`" if "/" in p else f"- {p}" for p in stage.loads)
+    items: list[str] = []
+    for p in stage.loads:
+        items += _DRAFT_INPUTS["full" if tier == "full" else "light"] if p == "@draft-inputs" else [p]
+    loads = "\n".join(f"- `{fmt(p)}`" if p.startswith("research/") else f"- {fmt(p)}" for p in items)
     outputs = []
     for o in stage.outputs:
         outputs.append({
@@ -177,7 +268,7 @@ def render_context(stage: Stage, tag: str, tier: str, query: str, hpr: str, skil
     avoid = [
         "`.hyperresearch/hermes/SKILL.md` — the orchestrator entry. Code sequences the run; you don't need it.",
         "other steps' files under `.hyperresearch/hermes/steps/`",
-        *stage.avoid,
+        *(fmt(a) for a in stage.avoid),
     ]
     extra = stage.extra
     if extra == "@bootstrap":
@@ -360,7 +451,7 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
         sdir.mkdir(exist_ok=True)
         ctx = render_context(stage, tag, tier, query, hpr, skill_text, "\n\n".join(handoffs[-3:]))
         (sdir / "CONTEXT.md").write_text(ctx, encoding="utf-8")
-        tier_name = cfg.stages.get(step, cfg.orchestrator_tier)
+        tier_name = stage_tier(cfg, step, tier)
         toolsets = ["file", "terminal"] + (["web"] if stage.web else [])
         log = sdir / "session.log.jsonl"
         _hpr_json(hpr, ["run", "step", tag, step, "--status", "running"], vault_root)

@@ -94,14 +94,28 @@ model = "claude-sonnet-5"
 provider = "anthropic"
 model = "claude-opus-5-5"
 
-# ICM mode (`hpr hermes icm`): pipeline step -> tier for that stage's session.
-# Steps not listed use orchestrator_tier.
+# ICM mode (`hpr hermes icm`): pipeline step -> tier for that stage's own
+# session. "<step>@<tier>" overrides one run tier. Unlisted steps use
+# orchestrator_tier. Subagents a stage spawns follow [hermes.roles].
 [hermes.stages]
-"1" = "analysis"
-"2" = "analysis"
-"10" = "synthesis"
-"15" = "analysis"
-"16" = "analysis"
+"10@light" = "synthesis"   # light: the stage writes the report itself
+# full: steps 10/11/12 coordinate Opus subagents (draft-orchestrators,
+# synthesizer, critics) per [hermes.roles]; the stage sessions stay on analysis.
+
+# Publishing a finished run into an Obsidian vault (`hpr hermes publish`,
+# or `hpr hermes icm --publish`). Off until `vault` is set. Keep real paths in
+# your local copy of this file, not in anything you commit.
+[hermes.publish]
+vault = ""                        # absolute path to the Obsidian vault
+library = "research/sources"      # shared source library (one note per source)
+reports = "research/reports"      # reports for runs without --project
+runs = "research/runs"            # one sealed folder per run
+reports_subdir = "Research"       # with --project P: reports go to P/Research/
+write_prefix = []                 # e.g. ["runuser", "-u", "vault", "--"]
+
+# Optional list prices, $/Mtok: [input, output, cache_read, cache_write].
+# Used only for the estimated cost in published run records.
+[hermes.prices]
 
 # Role -> tier. Roles match upstream's ModelMap keys.
 [hermes.roles]

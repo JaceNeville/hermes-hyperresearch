@@ -29,8 +29,30 @@ def test_every_tier_step_has_a_stage_and_step_file(hvault: Path):
 
 def test_stage_models_configured(hvault: Path):
     cfg = hermes.load_config(hvault)
-    assert cfg.tier(cfg.stages["10"]).model == "claude-opus-5-5"  # the writing stage
-    assert cfg.tier(cfg.stages["2"]).model == "claude-sonnet-5"
+    model = lambda step, tier: cfg.tier(hermes_icm.stage_tier(cfg, step, tier)).model  # noqa: E731
+    assert model("10", "light") == "claude-opus-5-5"  # light: the stage writes the report
+    assert model("10", "full") == "claude-sonnet-5"   # full: Opus draft-orchestrators do the writing
+    assert model("2", "light") == "claude-sonnet-5"
+    assert cfg.tier(cfg.roles["synthesizer"]).model == "claude-opus-5-5"
+
+
+def test_full_stages_list_existing_outputs_in_step_exit_criteria(hvault: Path):
+    """Every file a stage's code check demands is named by the step's own exit criterion."""
+    for step in hermes_icm.TIER_STEPS["full"]:
+        text = (hvault / hermes.STEPS_DIR / f"{hermes_icm.STEP_FILES[step]}.md").read_text()
+        for out in hermes_icm.STAGES[step].outputs:
+            if out.startswith("@") or out.endswith("/"):
+                continue
+            name = out.replace("research/runs/{tag}/", "").replace("research/notes/", "")
+            name = name.replace("{tag}", "<vault_tag>")
+            assert name.split("/")[-1] in text, (step, out)
+
+
+def test_full_draft_stage_loads_digest_not_raw_notes(hvault: Path):
+    skill = (hvault / hermes.ENTRY_SKILL).read_text()
+    ctx = hermes_icm.render_context(hermes_icm.STAGES["10"], "t", "full", "q", "/opt/hpr", skill, "")
+    assert "temp/evidence-digest.md" in ctx
+    assert "8-15 most relevant" not in ctx
 
 
 def test_context_is_self_contained(hvault: Path):
@@ -56,7 +78,7 @@ def test_stage1_carries_bootstrap_from_installed_skill(hvault: Path):
 def test_fetch_stage_forces_small_parallel_batches(hvault: Path):
     skill = (hvault / hermes.ENTRY_SKILL).read_text()
     ctx = hermes_icm.render_context(hermes_icm.STAGES["2"], "t", "light", "q", "/opt/hpr", skill, "")
-    assert "at most **5 URLs**" in ctx
+    assert "at most **3 URLs**" in ctx
     assert "`web_search`" in ctx
 
 

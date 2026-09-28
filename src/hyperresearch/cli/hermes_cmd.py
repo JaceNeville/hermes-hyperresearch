@@ -204,6 +204,8 @@ def icm(
     query: str = typer.Argument(None, help="Research query (or use --query-file)."),
     query_file: Path | None = typer.Option(None, "--query-file", help="Read the query from a file."),
     tier: str | None = typer.Option(None, "--tier", help="light | full | auto (default: hermes.toml default_tier)."),
+    publish: bool = typer.Option(False, "--publish", help="Publish to the Obsidian vault when the gate passes."),
+    project: str | None = typer.Option(None, "--project", help="Obsidian project folder the report belongs to."),
     json_output: bool = typer.Option(False, "--json", "-j"),
 ) -> None:
     """Run the pipeline ICM-style: code sequences stages, each a fresh session."""
@@ -228,12 +230,44 @@ def icm(
         _fail(str(e), "ICM_ERROR", json_output)
     data["spend"] = _spawn_spend(vault.root, data["vault_tag"])
     ok = data["gate_passed"]
+    if ok and (publish or project):
+        from hyperresearch.core import hermes_publish
+
+        try:
+            data["published"] = hermes_publish.publish_run(
+                vault.root, data["vault_tag"], _resolve_executable(), project=project
+            ).as_dict()
+        except hermes.HermesError as e:
+            data["published"] = {"error": str(e)}
     if json_output:
         output(success(data, vault=str(vault.root)) if ok else error(json.dumps(data), "RUN_NOT_DONE"), json_mode=True)
     else:
         console.print(json.dumps(data, indent=2))
     if not ok:
         raise typer.Exit(1)
+
+
+@app.command("publish")
+def publish_cmd(
+    vault_tag: str = typer.Argument(..., help="Run to publish."),
+    project: str | None = typer.Option(None, "--project", help="Obsidian project folder the report belongs to."),
+    json_output: bool = typer.Option(False, "--json", "-j"),
+) -> None:
+    """Publish a finished run (report, sources, run record) into the Obsidian vault."""
+    from hyperresearch.core import hermes, hermes_publish
+    from hyperresearch.core.agent_docs import _resolve_executable
+
+    vault = _vault(json_output)
+    try:
+        res = hermes_publish.publish_run(vault.root, vault_tag, _resolve_executable(), project=project)
+    except hermes.HermesError as e:
+        _fail(str(e), "PUBLISH_ERROR", json_output)
+    d = res.as_dict()
+    if json_output:
+        output(success(d, vault=str(vault.root)), json_mode=True)
+    else:
+        console.print(f"report: {d['report']}\nrun record: {d['run_record']}")
+        console.print(f"sources: {len(d['sources_new'])} new, {len(d['sources_existing'])} already in library")
 
 
 @app.command("run")
