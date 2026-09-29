@@ -52,6 +52,14 @@ class PublishConfig:
     runs: str = "research/runs"
     reports_subdir: str = "Research"
     write_prefix: list[str] = field(default_factory=list)
+    # Optional: write through another host (ssh destination) and/or at a
+    # different path there. Needed when the Obsidian app runs on a machine
+    # that mounts the vault over NFS: NFS doesn't send change notifications
+    # between clients, so files written from elsewhere stay invisible to the
+    # app until it rescans. Writing on the app's own host makes them appear
+    # at once. write_prefix then runs on that host (e.g. docker exec ...).
+    write_ssh: str = ""
+    write_root: str = ""
     prices: dict[str, list[float]] = field(default_factory=dict)  # model -> [in, out, cache_read, cache_write] $/Mtok
 
     @property
@@ -157,8 +165,12 @@ def _run_json(hpr: str, args: list[str], cwd: Path) -> dict:
         return {}
 
 
-def _write_tree(files: dict[str, str], dest_root: Path, prefix: list[str]) -> None:
-    """Write {relpath: text} under dest_root, via `prefix` if set, as one tar stream."""
+def _write_tree(files: dict[str, str], dest_root: Path, prefix: list[str], ssh: str = "") -> None:
+    """Write {relpath: text} under dest_root, via `prefix` if set, as one tar stream.
+
+    With `ssh`, the prefix + tar command run on that host (arguments quoted
+    for the remote shell) and dest_root is a path on that host.
+    """
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         dirs = sorted({str(Path(r).parent) for r in files} - {"."})
@@ -172,6 +184,10 @@ def _write_tree(files: dict[str, str], dest_root: Path, prefix: list[str]) -> No
             ti.size, ti.mode, ti.mtime = len(data), 0o644, int(datetime.now(UTC).timestamp())
             tar.addfile(ti, io.BytesIO(data))
     cmd = [*prefix, "tar", "-C", str(dest_root), "-xf", "-", "--no-same-owner", "--no-same-permissions"]
+    if ssh:
+        import shlex
+
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ssh, shlex.join(cmd)]
     p = subprocess.run(cmd, input=buf.getvalue(), capture_output=True, cwd="/tmp", timeout=300)
     if p.returncode != 0:
         raise hermes.HermesError(f"publish write failed: {p.stderr.decode(errors='replace')[-500:]}")
@@ -272,7 +288,7 @@ def publish_run(vault_root: Path, tag: str, hpr: str, project: str | None = None
     files[f"{cfg.runs}/{tag}/RUN.md"] = _run_record(
         tag, manifest, query_body, run_dir, cfg, report_rel, new, existing, interim, project
     )
-    _write_tree(files, dest, cfg.write_prefix)
+    _write_tree(files, Path(cfg.write_root) if cfg.write_root else dest, cfg.write_prefix, cfg.write_ssh)
     return PublishResult(report_rel, f"{cfg.runs}/{tag}/RUN.md", new, existing, renamed, interim)
 
 

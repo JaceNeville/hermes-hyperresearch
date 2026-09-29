@@ -120,3 +120,21 @@ def test_second_run_with_same_title_gets_its_own_report(tmp_path: Path, monkeypa
     res = hp.publish_run(tmp_path / "carpet-aaaaaa", "carpet-aaaaaa", "hpr", cfg=hp.PublishConfig(vault=str(obs)))
     assert res.report == reports[0]
     assert len(list((obs / "research/reports").iterdir())) == 2
+
+
+def test_remote_write_command_is_quoted(monkeypatch, tmp_path: Path):
+    seen = {}
+
+    class P:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return P()
+
+    monkeypatch.setattr(hp.subprocess, "run", fake_run)
+    hp._write_tree({"a b/c.md": "x"}, Path("/vault/Neville & Sons"), ["docker", "exec", "-i", "web"], ssh="root@h")
+    cmd = seen["cmd"]
+    assert cmd[:5] == ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15"] and cmd[5] == "root@h"
+    assert "'/vault/Neville & Sons'" in cmd[6] and cmd[6].startswith("docker exec -i web tar -C")

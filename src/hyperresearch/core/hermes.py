@@ -115,6 +115,11 @@ reports = "research/reports"      # reports for runs without --project
 runs = "research/runs"            # one sealed folder per run
 reports_subdir = "Research"       # with --project P: reports go to P/Research/
 write_prefix = []                 # e.g. ["runuser", "-u", "vault", "--"]
+# If the Obsidian app mounts the vault over NFS on another machine, write
+# there so the app sees new files immediately (NFS has no cross-client
+# change notifications). write_prefix then runs on that host.
+write_ssh = ""                    # ssh destination, e.g. "root@obsidian-host"
+write_root = ""                   # vault path on that host (default: vault)
 
 # Optional list prices, $/Mtok: [input, output, cache_read, cache_write].
 # Used only for the estimated cost in published run records.
