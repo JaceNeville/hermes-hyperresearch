@@ -12,6 +12,8 @@ rendered page. For agent hosts too small to run browsers locally.
     max_parallel = 4                 # concurrent remote browsers (flock slots)
 
 Or set HPR_REMOTE_FETCH_HOST in the environment (overrides the file).
+`host = "local"` runs the same throwaway browser on this machine, no ssh
+(for worker containers that ship Chromium; set `chromium` to its path).
 Select it with `[web] provider = "remote"` in config.toml or `--provider remote`.
 
 Safety:
@@ -180,7 +182,11 @@ class RemoteBrowserProvider:
         return not (result.looks_like_login_wall(url, self._gates) or result.looks_like_junk(self._gates))
 
     def _remote(self, url: str) -> WebResult:
-        cmd = ["ssh", *self._cfg.ssh_options, self._cfg.host, build_remote_command(url, self._cfg)]
+        remote = build_remote_command(url, self._cfg)
+        # host = "local": the browser is on this machine (e.g. a worker
+        # container that ships Chromium). Same command, no ssh hop.
+        cmd = (["sh", "-c", remote] if self._cfg.host == "local"
+               else ["ssh", *self._cfg.ssh_options, self._cfg.host, remote])
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, timeout=self._cfg.timeout_s + 30, stdin=subprocess.DEVNULL

@@ -206,3 +206,21 @@ def test_fetcher_role_is_not_blocked(monkeypatch):
     hermes.guard_orchestrator_fetch(json_output=True)  # no exception
     monkeypatch.delenv(hermes.ROLE_ENV)
     hermes.guard_orchestrator_fetch(json_output=True)
+
+
+
+def test_chat_env_reads_current_pass_file(tmp_path, monkeypatch):
+    """Worker runs: every spawn picks up the pass file's current contents."""
+    from hyperresearch.core import hermes as h
+
+    f = tmp_path / "pass"
+    f.write_text("sk-ant-oat01-first\n")
+    monkeypatch.setenv(h.PASS_FILE_ENV, str(f))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert h.chat_env(tmp_path, "fetcher")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-first"
+    f.write_text("sk-ant-oat01-second")
+    assert h.chat_env(tmp_path, "fetcher")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-second"
+    f.unlink()  # missing file: leave the env alone rather than crash a spawn
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in h.chat_env(tmp_path, "fetcher")
+    monkeypatch.delenv(h.PASS_FILE_ENV)
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in h.chat_env(tmp_path, "fetcher")

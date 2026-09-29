@@ -31,8 +31,8 @@ def test_stage_models_configured(hvault: Path):
     cfg = hermes.load_config(hvault)
     model = lambda step, tier: cfg.tier(hermes_icm.stage_tier(cfg, step, tier)).model  # noqa: E731
     assert model("10", "light") == "claude-opus-5-5"  # light: the stage writes the report
-    assert model("10", "full") == "claude-sonnet-5"   # full: Opus draft-orchestrators do the writing
-    assert model("2", "light") == "claude-sonnet-5"
+    assert model("10", "full") == "claude-sonnet-5-5"   # full: Opus draft-orchestrators do the writing
+    assert model("2", "light") == "claude-sonnet-5-5"
     assert cfg.tier(cfg.roles["synthesizer"]).model == "claude-opus-5-5"
 
 

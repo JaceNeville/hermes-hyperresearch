@@ -122,3 +122,22 @@ def test_remote_ssrf_checked_before_ssh(monkeypatch):
     with pytest.raises(SafeHTTPError):
         p.fetch("https://10.0.0.1/admin")
     assert p.remote_calls == []
+
+
+@pytest.mark.parametrize("host,first", [("local", "sh"), ("my-box", "ssh")])
+def test_local_host_runs_browser_without_ssh(monkeypatch, host, first):
+    import subprocess
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, stdout=b"<html>" + b"x" * 400 + b"</html>", stderr=b"")
+
+    monkeypatch.setattr(rp.subprocess, "run", fake_run)
+    p = rp.RemoteBrowserProvider.__new__(rp.RemoteBrowserProvider)
+    p._cfg = rp.RemoteFetchConfig(host=host)
+    p._local = _FakeLocal()
+    rp.RemoteBrowserProvider._remote(p, "https://x.org/d")
+    assert seen["cmd"][0] == first
+    assert ("my-box" in seen["cmd"]) == (host != "local")

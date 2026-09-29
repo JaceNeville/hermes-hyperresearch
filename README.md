@@ -112,7 +112,7 @@ Answer with `hpr hermes intake --id <id> --answers "..."`, then start with `hpr 
 ```toml
 [hermes.tiers.analysis]
 provider = "anthropic"
-model = "claude-sonnet-5"
+model = "claude-sonnet-5-5"
 
 [hermes.stages]            # a stage's own session; "<step>@<tier>" overrides one tier
 "10@light" = "synthesis"
@@ -157,7 +157,7 @@ reports_subdir = "Research"      # with --project P, reports land in P/Research/
 write_prefix = []                # e.g. ["runuser", "-u", "vault", "--"] for a vault owned by another user
 
 [hermes.prices]                  # optional, $/Mtok [input, output, cache_read, cache_write]
-"claude-sonnet-5" = [3, 15, 0.30, 3.75]
+"claude-sonnet-5-5" = [3, 15, 0.30, 3.75]
 ```
 
 What gets written:

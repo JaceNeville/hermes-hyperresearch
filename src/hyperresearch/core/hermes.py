@@ -93,7 +93,7 @@ model = "claude-haiku-4-5"
 
 [hermes.tiers.analysis]
 provider = "anthropic"
-model = "claude-sonnet-5"
+model = "claude-sonnet-5-5"
 
 [hermes.tiers.synthesis]
 provider = "anthropic"
@@ -535,7 +535,29 @@ def chat_env(workdir: Path, role: str) -> dict[str, str]:
     env["TERMINAL_CWD"] = str(Path(workdir).resolve())
     env["HPR_VAULT_ROOT"] = str(Path(workdir).resolve())
     env[ROLE_ENV] = role
+    _apply_pass_file(env)
     return env
+
+
+PASS_FILE_ENV = "HPR_CLAUDE_PASS_FILE"
+
+
+def _apply_pass_file(env: dict[str, str]) -> None:
+    """Worker hosts: read the current short-lived Claude pass at every spawn.
+
+    A run outlives one pass, so the dispatching host rewrites the file with a
+    fresh pass while the run is going; each new `hermes chat` picks up
+    whatever is current. The pass never goes on a command line or into a log.
+    """
+    path = env.get(PASS_FILE_ENV)
+    if not path:
+        return
+    try:
+        tok = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
 
 
 def guard_orchestrator_fetch(json_output: bool = False) -> None:
