@@ -192,3 +192,8 @@ def test_intake_structure_file_config(hvault: Path, tmp_path: Path):
     text, src = hermes_intake._structure_text(hvault, hermes.load_config(hvault))
     assert text == "MY STRUCTURE" and src == str(f)
     assert os.path.exists(f)
+
+
+def test_gate_output_is_never_a_stray(tmp_path):
+    from hyperresearch.core import hermes_guard
+    assert hermes_guard.allowed_run_names(tmp_path).match("grounding.json")

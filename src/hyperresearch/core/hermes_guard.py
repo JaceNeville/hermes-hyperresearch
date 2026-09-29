@@ -113,7 +113,10 @@ def restore(vault_root: Path, rels: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 # Always legitimate at the top of a run folder, whatever the step files say.
-_RUN_BASE = {"run.json", "events.jsonl", "query.md", "scaffold.md", "stages", "temp", "shims", "interim"}
+# Files code itself writes into a run folder (never strays). grounding.json is the
+# ship gate's findings file (runs.verify_run), so it must survive the sweep.
+_RUN_BASE = {"run.json", "events.jsonl", "query.md", "scaffold.md", "stages", "temp", "shims", "interim",
+             "grounding.json"}
 _NAME_RE = re.compile(r"research/runs/<vault_tag>/([A-Za-z0-9_.<>*{},\-]+)")
 
 
