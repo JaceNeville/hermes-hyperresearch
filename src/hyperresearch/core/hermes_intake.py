@@ -111,8 +111,14 @@ style, tone). Ask at most {MAX_QUESTIONS} questions, each answerable in one line
 If answers were given above, use them and do not ask again about the same
 point.
 
-Also pick a tier: "light" (a focused practical question, ~20 minutes) or
-"full" (contested, multi-sided, or high-stakes, 2+ hours).
+Also pick a tier. Default to "light" (~20 minutes, a few dollars). Choose
+"full" (2+ hours, tens of dollars) only when at least one applies:
+- the question is contested or has several competing sides to weigh
+- the report will be customer-facing or used to train staff
+- it makes health, safety, legal, warranty or contract claims
+- experts or skeptics will read it and it has to hold up
+Practical how-to questions, single decisions, and internal-only use stay
+"light". Name the reason for "full" in the assumptions.
 
 ## Output
 

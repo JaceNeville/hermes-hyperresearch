@@ -612,6 +612,13 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
             f"```json\n{json.dumps(failed, indent=2)[:4000]}\n```\n\n"
             f"Run `{hpr} run finish {tag} --json` to see details, fix the REPORT "
             f"(`{REPORT.format(tag=tag)}`) with surgical `patch` edits, and stop once it passes.\n\n"
+            "**If `grounding` failed:** read `research/runs/" + tag + "/grounding.json`. Each finding is a "
+            "number, quote or named source in a cited sentence that the cited note does not contain. For each: "
+            "open the cited note; if it states the fact differently, correct the sentence to match the note "
+            "exactly; if another vault note states it, cite that note instead; otherwise delete the number/"
+            "quote/attribution or the whole sentence. Never invent a replacement and never add a citation "
+            "you have not opened. A report that says less is acceptable; a report that says something its "
+            "sources don't is not.\n\n"
             + _section(skill_text, "**The gate's verdict is final.", "Ship only after")
             + "\n",
             encoding="utf-8",
@@ -661,7 +668,7 @@ def cite_precheck(vault_root: Path, cfg: hermes.HermesConfig, tag: str, hpr: str
     """Step 14.5.1-14.5.2 in code: extract, batch, spawn checkers, merge findings."""
     run_dir = vault_root / R.format(tag=tag)
     t0 = time.monotonic()
-    ext = _hpr_json(hpr, ["citecheck", "extract", tag], vault_root)
+    ext = _hpr_json(hpr, ["citecheck", "extract", tag, "--sample-rate", "1.0"], vault_root)
     pairs_path = run_dir / "cite-check-pairs.json"
     if not ext.get("ok") or not pairs_path.exists():
         raise hermes.HermesError(f"citecheck extract failed: {ext.get('error')}")
@@ -672,9 +679,25 @@ def cite_precheck(vault_root: Path, cfg: hermes.HermesConfig, tag: str, hpr: str
         "cited_note_id": d.get("note_id") or d.get("citation"), "correct_note_id": None,
         "evidence": "Citation resolves to no vault note (dangling).", "suggested_fix": "swap citation or delete sentence",
     } for d in (pairs.get("dangling") or [])]
+    from hyperresearch.core import grounding
+
+    report = vault_root / REPORT.format(tag=tag)
+    gres = grounding.check_file(vault_root, report)
+    grounding.write_findings(run_dir / "grounding.json", gres)
+    for f in gres.findings:
+        if f.kind == "dangling":
+            continue
+        findings.append({
+            "verdict": "unsupported", "severity": "critical", "sentence": f.sentence,
+            "cited_note_id": f.cited[0] if f.cited else None, "correct_note_id": None,
+            "evidence": f"Deterministic grounding check: {f.kind} {f.missing} not found in the cited source(s) {f.cited}.",
+            "suggested_fix": "swap to a note that contains it, or remove/soften the unsupported "
+                             f"{f.kind}; never replace it with a new unsourced one",
+        })
     batches = cite_batches(len(sampled), cfg.cite_batch)
     echo(f"  stage 14.5 pre-check (code): {len(sampled)} pairs -> {len(batches)} cite-checker batch(es) "
-         f"of <= {cfg.cite_batch}, {len(findings)} dangling")
+         f"of <= {cfg.cite_batch}; grounding {gres.cited_sentences} sentences, {len(gres.findings)} flagged; "
+         f"{len(findings)} findings before checkers")
     query = (run_dir / "query.md").read_text(encoding="utf-8") if (run_dir / "query.md").exists() else ""
     jobs = []
     for n, (a, b) in enumerate(batches, 1):

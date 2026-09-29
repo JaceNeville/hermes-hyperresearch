@@ -638,6 +638,25 @@ def verify_run(vault, vault_tag: str) -> dict:
         except Exception as exc:
             check("content-lints", False, f"content lint rules failed to run: {exc}")
 
+        # Grounding: every cited sentence, deterministically. A number, quote
+        # or named attribution that isn't in the cited source blocks shipping.
+        try:
+            from hyperresearch.core import grounding
+
+            g = grounding.check_file(vault.root, report_path)
+            grounding.write_findings(run_dir / "grounding.json", g)
+            first = g.findings[0] if g.findings else None
+            check(
+                "grounding",
+                g.ok,
+                f"{g.cited_sentences} cited sentences, all grounded" if g.ok else (
+                    f"{len(g.findings)} ungrounded {g.by_kind()} — see {run_dir / 'grounding.json'}; "
+                    f"first: {first.kind} {first.missing} in: {first.sentence[:140]}"
+                ),
+            )
+        except Exception as exc:
+            check("grounding", False, f"grounding check failed to run: {exc}")
+
     # Tier-mandated artifacts, keyed on the tier the run actually ran (see
     # _required_step_ids) rather than the profile it was initialized with.
     steps = _required_step_ids(manifest, run_dir, vault.config_path)

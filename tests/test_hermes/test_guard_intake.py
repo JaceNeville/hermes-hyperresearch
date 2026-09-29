@@ -108,6 +108,7 @@ def test_cite_precheck_spawns_one_checker_per_batch(hvault: Path, monkeypatch):
     run = hvault / "research" / "runs" / tag
     run.mkdir(parents=True)
     (run / "query.md").write_text("the question")
+    (hvault / "research" / "notes" / f"final_report_{tag}.md").write_text("A claim of 30 years [[n]].\n")
     sampled = [{"sentence": f"s{i}", "note_id": "n"} for i in range(65)]
     (run / "cite-check-pairs.json").write_text(json.dumps(
         {"summary": {}, "sampled_for_llm": sampled, "dangling": [{"sentence": "d", "note_id": None, "citation": "[[x]]"}]}))
@@ -130,7 +131,9 @@ def test_cite_precheck_spawns_one_checker_per_batch(hvault: Path, monkeypatch):
     assert len(seen["jobs"]) == 3
     assert "sampled_for_llm[60..64]" in (sdir / "cite-checker-3.md").read_text()
     merged = json.loads((run / "cite-check-findings.json").read_text())
-    assert len(merged) == 4 and merged[0]["severity"] == "critical"  # 1 dangling + 3 batches
+    # 1 dangling + 1 grounding (cited note "n" missing -> dangling, not double-counted) + 3 batches
+    assert len(merged) == 4 and merged[0]["severity"] == "critical"
+    assert (run / "grounding.json").exists()
     assert row["status"].startswith("3 batches")
 
 

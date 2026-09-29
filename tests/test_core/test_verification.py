@@ -16,6 +16,21 @@ from hyperresearch.core.independence import canonical_url, compute_independence
 from hyperresearch.core.runs import init_run, run_report_data, set_step, verify_run
 
 
+@pytest.fixture(autouse=True)
+def _src_note(request):
+    """Reports in this file cite [[src-note]]; the grounding gate needs it to exist."""
+    if "tmp_vault" not in request.fixturenames:
+        yield
+        return
+    vault = request.getfixturevalue("tmp_vault")
+    notes = vault.root / "research" / "notes"
+    notes.mkdir(parents=True, exist_ok=True)
+    p = notes / "src-note.md"
+    if not p.exists():
+        p.write_text("---\ntitle: Source note\nid: src-note\n---\n\nSubstantive evidence.\n", encoding="utf-8")
+    yield
+
+
 @pytest.fixture
 def cited_vault(seeded_vault):
     """Seeded vault + claims + a source row so citations resolve."""
