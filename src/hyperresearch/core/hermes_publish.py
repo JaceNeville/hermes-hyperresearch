@@ -245,6 +245,12 @@ def publish_run(vault_root: Path, tag: str, hpr: str, project: str | None = None
         title = report_title(text, tag)
         folder = f"{project}/{cfg.reports_subdir}" if project else cfg.reports
         report_rel = f"{folder}/{date} {safe_title(title)}.md"
+        # One report per run: never overwrite another run's report.
+        existing_report = dest / report_rel
+        if existing_report.exists():
+            other_meta, _ = split_frontmatter(existing_report.read_text(encoding="utf-8", errors="replace"))
+            if tag not in str(other_meta.get("run", "")):
+                report_rel = f"{folder}/{date} {safe_title(title)} ({tag[-6:]}).md"
         meta, body = split_frontmatter(text)
         meta = {
             "title": title,

@@ -101,3 +101,22 @@ def test_publish_requires_vault(tmp_path: Path):
 def test_publish_rejects_escaping_project(tmp_path: Path):
     with pytest.raises(hermes.HermesError):
         hp.publish_run(tmp_path, "t", "hpr", project="../etc", cfg=hp.PublishConfig(vault=str(tmp_path)))
+
+
+def test_second_run_with_same_title_gets_its_own_report(tmp_path: Path, monkeypatch):
+    obs = tmp_path / "obs"
+    obs.mkdir()
+    notes = [{"id": "src-a", "path": "research/notes/src-a.md", "type": "note"}]
+    monkeypatch.setattr(hp, "_run_json", lambda *a, **k: {"data": notes})
+    reports = []
+    for tag in ("carpet-aaaaaa", "carpet-bbbbbb"):
+        work = tmp_path / tag
+        work.mkdir()
+        _fake_run(work, tag)
+        res = hp.publish_run(work, tag, "hpr", cfg=hp.PublishConfig(vault=str(obs)))
+        reports.append(res.report)
+    assert reports[0] != reports[1] and reports[1].endswith("(bbbbbb).md")
+    # re-publishing the same run updates its own report in place
+    res = hp.publish_run(tmp_path / "carpet-aaaaaa", "carpet-aaaaaa", "hpr", cfg=hp.PublishConfig(vault=str(obs)))
+    assert res.report == reports[0]
+    assert len(list((obs / "research/reports").iterdir())) == 2
