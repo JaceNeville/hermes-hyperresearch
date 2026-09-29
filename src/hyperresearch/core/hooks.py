@@ -4572,6 +4572,9 @@ def install_hermes(
     _set_render_state(profile, config_path if config_path.exists() else None, "codex")
     assert _RENDER_STATE is not None
     _RENDER_STATE["target"] = "hermes"
+    from hyperresearch.core import hermes_guard
+
+    hermes_guard.unlock_for_install(vault_root)
     try:
         actions: list[str] = []
         if hermes.ensure_config(vault_root):
@@ -4594,6 +4597,10 @@ def install_hermes(
         actions += _run_installers(
             [(lambda fn=fn: fn(vault_root, hpr_path)) for fn in _agent_installers("codex")]
         )
+        before = hermes_guard.lock_digest(vault_root)
+        n = hermes_guard.write_lock(vault_root)
+        if hermes_guard.lock_digest(vault_root) != before:
+            actions.append(f"Hermes: locked {n} pipeline files (agents can't change them; runs check them)")
         return actions
     finally:
         _RENDER_STATE = None

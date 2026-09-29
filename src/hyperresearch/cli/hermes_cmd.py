@@ -199,10 +199,53 @@ def _session_id(log_path: Path) -> str | None:
     return _parse_result(log_path).get("session_id")
 
 
+@app.command("intake")
+def intake_cmd(
+    question: str = typer.Argument(None, help="Rough research question (omit with --id to answer questions)."),
+    intake_id: str | None = typer.Option(None, "--id", help="Continue an intake that asked questions."),
+    answers: str = typer.Option("", "--answers", help="Answers to the intake's questions, free text."),
+    json_output: bool = typer.Option(False, "--json", "-j"),
+) -> None:
+    """Scope a research question before any research runs: build the prompt or ask up to 3 questions."""
+    from hyperresearch.core import hermes, hermes_intake
+
+    vault = _vault(json_output)
+    if not (question or intake_id):
+        _fail("give a rough question, or --id with --answers", "NO_QUESTION", json_output)
+    try:
+        res = hermes_intake.run_intake(vault.root, question or "", answers, intake_id)
+    except hermes.HermesError as e:
+        _fail(str(e), "INTAKE_ERROR", json_output)
+    _emit_intake(res, vault, json_output)
+    if res.status != "ready":
+        raise typer.Exit(3)
+
+
+def _emit_intake(res, vault, json_output: bool) -> None:
+    d = res.as_dict()
+    if json_output:
+        output(success(d, vault=str(vault.root)), json_mode=True)
+        return
+    console.print(f"intake {res.intake_id}: [bold]{res.status}[/] (suggested tier: {res.tier or '-'})")
+    if res.status == "ready":
+        console.print(res.prompt)
+        console.print(f"[dim]start it: hpr hermes icm --from-intake {res.intake_id}[/]")
+    elif res.status == "needs_input":
+        for i, q in enumerate(res.questions, 1):
+            console.print(f"  {i}. {q}")
+        console.print(f"[dim]answer: hpr hermes intake --id {res.intake_id} --answers \"...\"[/]")
+    else:
+        console.print(f"[red]{res.error}[/] (see {res.path})")
+    for a in res.assumptions:
+        console.print(f"  [dim]assumed: {a}[/]")
+
+
 @app.command("icm")
 def icm(
     query: str = typer.Argument(None, help="Research query (or use --query-file)."),
     query_file: Path | None = typer.Option(None, "--query-file", help="Read the query from a file."),
+    intake: bool = typer.Option(False, "--intake", help="Scope the query first; stop with questions if it needs them."),
+    from_intake: str | None = typer.Option(None, "--from-intake", help="Run the finished prompt of this intake."),
     tier: str | None = typer.Option(None, "--tier", help="light | full | auto (default: hermes.toml default_tier)."),
     publish: bool = typer.Option(False, "--publish", help="Publish to the Obsidian vault when the gate passes."),
     project: str | None = typer.Option(None, "--project", help="Obsidian project folder the report belongs to."),
@@ -217,11 +260,24 @@ def icm(
         _fail("not installed for Hermes; run `hpr hermes install` first", "NOT_INSTALLED", json_output)
     if query_file:
         query = query_file.read_text(encoding="utf-8")
+    intake_tier = None
+    if from_intake or intake:
+        from hyperresearch.core import hermes_intake
+
+        try:
+            res = (hermes_intake.load_ready(vault.root, from_intake) if from_intake
+                   else hermes_intake.run_intake(vault.root, query or ""))
+        except hermes.HermesError as e:
+            _fail(str(e), "INTAKE_ERROR", json_output)
+        if res.status != "ready":
+            _emit_intake(res, vault, json_output)
+            raise typer.Exit(3)
+        query, intake_tier = res.prompt, res.tier or None
     if not query or not query.strip():
         _fail("empty research query", "NO_QUERY", json_output)
     try:
         cfg = hermes.load_config(vault.root)
-        tier_cap = tier or cfg.default_tier
+        tier_cap = tier or intake_tier or cfg.default_tier
         if tier_cap not in ("light", "full", "auto"):
             _fail("--tier must be light, full, or auto", "BAD_TIER", json_output)
         echo = (lambda *_: None) if json_output else (lambda m: console.print(m))

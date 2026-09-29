@@ -77,6 +77,8 @@ reserve_mb = 700
 # ICM runs stop (blocked, resumable) once estimated spend passes this, in USD.
 # Needs [hermes.prices]. 0 = no ceiling.
 max_cost_usd = 0
+# ICM step 14.5: code splits cite-checking into batches of this many pairs.
+cite_batch = 30
 # Hard wall-clock cap per subagent, seconds.
 spawn_timeout_s = 1800
 # Tool-call iteration cap per subagent.
@@ -104,6 +106,13 @@ model = "claude-opus-5-5"
 "10@light" = "synthesis"   # light: the stage writes the report itself
 # full: steps 10/11/12 coordinate Opus subagents (draft-orchestrators,
 # synthesizer, critics) per [hermes.roles]; the stage sessions stay on analysis.
+
+# Intake (`hpr hermes intake`, or `hpr hermes icm --intake`): before stage 1,
+# one small session turns a rough question into a full research prompt using
+# your prompt-structure file, or asks up to 3 clarifying questions first.
+[hermes.intake]
+structure_file = ""               # path (absolute or vault-relative); "" = built-in
+tier = "analysis"
 
 # Publishing a finished run into an Obsidian vault (`hpr hermes publish`,
 # or `hpr hermes icm --publish`). Off until `vault` is set. Keep real paths in
@@ -170,6 +179,9 @@ class HermesConfig:
     tiers: dict[str, Tier] = field(default_factory=dict)
     roles: dict[str, str] = field(default_factory=dict)
     stages: dict[str, str] = field(default_factory=dict)
+    intake_structure_file: str = ""
+    intake_tier: str = "analysis"
+    cite_batch: int = 30
 
     def tier_for_role(self, role: str | None) -> Tier:
         name = self.roles.get(role or "", "analysis")
@@ -207,12 +219,16 @@ def load_config(vault_root: Path) -> HermesConfig:
         tiers=tiers,
         roles={**defaults["roles"], **data.get("roles", {})},
         stages={**defaults["stages"], **data.get("stages", {})},
+        intake_structure_file=str((data.get("intake") or {}).get("structure_file", "")),
+        intake_tier=str((data.get("intake") or {}).get("tier", "analysis")),
+        cite_batch=int(data.get("cite_batch", defaults.get("cite_batch", 30))),
     )
     if cfg.default_tier not in ("light", "full", "auto"):
         raise HermesError("default_tier must be light, full, or auto")
     for tier in [*cfg.roles.values(), *cfg.stages.values()]:
         cfg.tier(tier)  # raises on a dangling tier name
     cfg.tier(cfg.orchestrator_tier)
+    cfg.tier(cfg.intake_tier)
     if cfg.max_parallel < 1:
         raise HermesError("max_parallel must be >= 1")
     return cfg

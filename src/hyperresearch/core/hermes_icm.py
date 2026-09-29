@@ -197,13 +197,7 @@ STAGES: dict[str, Stage] = {
         loads=[*_BASE, REPORT],
         outputs=[R + "/cite-check-pairs.json", R + "/cite-check-findings.json"],
         avoid=[_NO_BULK],
-        extra=(
-            "**Cite-checker batching (this runtime, overrides the step's one-or-two rule):** split "
-            "`sampled_for_llm` into batches of at most **30 pairs**, one `hyperresearch-cite-checker` "
-            "per batch, all launched in ONE `hpr hermes spawn` call. Give each checker its own index "
-            "range and findings file (`cite-check-findings-<n>.json`), then merge them into "
-            "`cite-check-findings.json`. Small batches keep each checker's session short."
-        ),
+        extra="@cite-precheck",
     ),
     "15": Stage("15", "polish", loads=[R + "/query.md", REPORT, _SHIMS + "polish.md"], outputs=[R + "/polish-log.json"]),
     "16": Stage("16", "readability-audit", loads=[R + "/query.md", REPORT], outputs=[R + "/readability-recommendations.json"]),
@@ -322,6 +316,14 @@ def render_context(stage: Stage, tag: str, tier: str, query: str, hpr: str, skil
         ) if x)
     elif extra == "@length":
         extra = length + (" Tell the synthesizer this target explicitly." if length else "")
+    if extra == "@cite-precheck":
+        extra = (
+            "**Steps 14.5.1 and 14.5.2 are already done, by code.** Code ran `citecheck extract`, split "
+            "`sampled_for_llm` into batches, ran one `hyperresearch-cite-checker` per batch, and merged "
+            f"their findings plus every dangling citation into `research/runs/{tag}/cite-check-findings.json`. "
+            "Do NOT re-run extraction or spawn cite-checkers. Start at step 14.5.3 (second patcher pass) "
+            "and finish the exit criterion."
+        )
     if extra == "@bootstrap":
         extra = (
             "**Before the procedure, finish the bootstrap** (code already minted the vault tag, "
@@ -474,6 +476,15 @@ def _write_index(vault_root: Path, tag: str, tier: str, rows: list[dict], sealed
 
 
 def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> dict:
+    from hyperresearch.core import hermes_guard as _g
+
+    changed = _g.changed_files(vault_root)
+    if changed:
+        raise hermes.HermesError(
+            "protected pipeline files changed since install: " + ", ".join(changed)
+            + ". Review them; if the change is intended re-run `hpr hermes install`, otherwise "
+            "`hpr hermes install` also restores the originals."
+        )
     cfg = hermes.load_config(vault_root)
     skill_text = (vault_root / hermes.ENTRY_SKILL).read_text(encoding="utf-8")
 
@@ -490,6 +501,9 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
         raise hermes.HermesError(f"run init failed: {init.get('error')}")
     echo(f"run {tag}: {run_dir.relative_to(vault_root)}")
 
+    from hyperresearch.core import hermes_guard
+
+    allowed = hermes_guard.allowed_run_names(vault_root)
     steps = list(TIER_STEPS["light" if tier in ("light", "auto") else "full"])
     rows: list[dict] = []
     handoffs: list[str] = []
@@ -506,7 +520,12 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
         toolsets = ["file", "terminal"] + (["web"] if stage.web else [])
         log = sdir / "session.log.jsonl"
         _hpr_json(hpr, ["run", "step", tag, step, "--status", "running"], vault_root)
+        if step == "14.5":
+            pre = cite_precheck(vault_root, cfg, tag, hpr, sdir, echo)
+            rows.append(pre)
+            _write_index(vault_root, tag, tier, rows, sealed=False)
         echo(f"  stage {step} {stage.title} ({cfg.tier(tier_name).model}) ...")
+        root_before = hermes_guard.snapshot_root(vault_root)
         t0 = time.monotonic()
         code, res = _run_session(vault_root, cfg, tier_name, toolsets, sdir / "CONTEXT.md", log)
         tokens = dict(res.get("tokens") or {})
@@ -527,6 +546,7 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
             missing = _check_outputs(vault_root, stage, tag, tier, hpr)
             attempts = 2
         dur = time.monotonic() - t0
+        _guard_after(vault_root, tag, sdir.name, root_before, allowed, echo)
         handoff = (res.get("text") or "").strip()[-1500:]
         (sdir / "handoff.md").write_text(handoff + "\n", encoding="utf-8")
         handoffs.append(f"### Stage {step} — {stage.title}\n{handoff}")
@@ -608,6 +628,87 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
     rows.append({"stage": "ship gate", "status": status})
     _write_index(vault_root, tag, tier, rows, sealed=status == "done")
     return _summary(vault_root, tag, tier, results, gate, hpr)
+
+
+def _guard_after(vault_root: Path, tag: str, label: str, root_before: set[str], allowed, echo) -> None:
+    """After every stage: restore protected files an agent changed; move strays aside."""
+    from hyperresearch.core import hermes_guard
+
+    changed = hermes_guard.changed_files(vault_root)
+    events = []
+    if changed:
+        restored = hermes_guard.restore(vault_root, changed)
+        echo(f"    guard: restored {len(restored)} protected file(s) changed during {label}: {restored}")
+        events.append({"event": "protected-restored", "stage": label, "files": restored})
+    strays = hermes_guard.sweep_strays(vault_root, tag, label, root_before, allowed)
+    if strays:
+        echo(f"    guard: moved {len(strays)} unrequested file(s) to stages/_strays/{label}/")
+        events.append({"event": "strays-moved", "stage": label, "files": strays})
+    if events:
+        log = vault_root / R.format(tag=tag) / "stages" / "guard.jsonl"
+        with open(log, "a", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps({"at": _now(), **e}) + "\n")
+
+
+def cite_batches(n_pairs: int, size: int) -> list[tuple[int, int]]:
+    """Inclusive (start, end) index ranges of at most `size` pairs."""
+    size = max(1, size)
+    return [(i, min(i + size, n_pairs) - 1) for i in range(0, n_pairs, size)]
+
+
+def cite_precheck(vault_root: Path, cfg: hermes.HermesConfig, tag: str, hpr: str, sdir: Path, echo) -> dict:
+    """Step 14.5.1-14.5.2 in code: extract, batch, spawn checkers, merge findings."""
+    run_dir = vault_root / R.format(tag=tag)
+    t0 = time.monotonic()
+    ext = _hpr_json(hpr, ["citecheck", "extract", tag], vault_root)
+    pairs_path = run_dir / "cite-check-pairs.json"
+    if not ext.get("ok") or not pairs_path.exists():
+        raise hermes.HermesError(f"citecheck extract failed: {ext.get('error')}")
+    pairs = json.loads(pairs_path.read_text(encoding="utf-8"))
+    sampled = pairs.get("sampled_for_llm") or []
+    findings = [{
+        "verdict": "unsupported", "severity": "critical", "sentence": d.get("sentence", ""),
+        "cited_note_id": d.get("note_id") or d.get("citation"), "correct_note_id": None,
+        "evidence": "Citation resolves to no vault note (dangling).", "suggested_fix": "swap citation or delete sentence",
+    } for d in (pairs.get("dangling") or [])]
+    batches = cite_batches(len(sampled), cfg.cite_batch)
+    echo(f"  stage 14.5 pre-check (code): {len(sampled)} pairs -> {len(batches)} cite-checker batch(es) "
+         f"of <= {cfg.cite_batch}, {len(findings)} dangling")
+    query = (run_dir / "query.md").read_text(encoding="utf-8") if (run_dir / "query.md").exists() else ""
+    jobs = []
+    for n, (a, b) in enumerate(batches, 1):
+        out = f"{R.format(tag=tag)}/cite-check-findings-{n}.json"
+        (run_dir / f"cite-check-findings-{n}.json").unlink(missing_ok=True)
+        msg = sdir / f"cite-checker-{n}.md"
+        msg.write_text(
+            f"RESEARCH QUERY (verbatim, gospel):\n> {query.strip()}\n\nQUERY FILE: {R.format(tag=tag)}/query.md\n\n"
+            "PIPELINE POSITION: You are step 14.5 (cite-checker) of the hyperresearch V8 pipeline. "
+            "You verify citation-sentence bindings. You do not edit the report.\n\n"
+            f"YOUR INPUTS:\n- pairs_file: {R.format(tag=tag)}/cite-check-pairs.json\n"
+            f"- your_range: sampled_for_llm[{a}..{b}] (inclusive; {b - a + 1} pairs)\n"
+            f"- findings_path: {out}\n- vault_tag: {tag}\n",
+            encoding="utf-8",
+        )
+        jobs.append(("hyperresearch-cite-checker", msg))
+    failed = []
+    if jobs:
+        batch_id = hermes.create_batch(vault_root, jobs, tag)
+        hermes.start_batch_detached(vault_root, batch_id)
+        summary = hermes.wait_batch(vault_root, batch_id, cfg.spawn_timeout_s + 120)
+        for n, _ in enumerate(batches, 1):
+            f = run_dir / f"cite-check-findings-{n}.json"
+            try:
+                part = json.loads(f.read_text(encoding="utf-8"))
+                findings += part if isinstance(part, list) else []
+            except (OSError, json.JSONDecodeError):
+                failed.append(n)
+        echo(f"    checkers: {summary['counts']}, peak parallel {summary.get('peak_parallel')}"
+             + (f"; no findings file from batch(es) {failed}" if failed else ""))
+    (run_dir / "cite-check-findings.json").write_text(json.dumps(findings, indent=1) + "\n", encoding="utf-8")
+    return {"stage": "14.5 pre-check (code)", "status": f"{len(batches)} batches, {len(findings)} findings"
+            + (f", batches {failed} missing" if failed else ""), "model": "code + cite-checkers",
+            "minutes": round((time.monotonic() - t0) / 60, 1), "tokens": ""}
 
 
 def _gate_passed(gate: dict | None) -> bool:

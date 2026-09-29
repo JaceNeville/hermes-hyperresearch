@@ -210,7 +210,7 @@ def test_draft_stage_rules(hvault: Path):
     ctx11 = hermes_icm.render_context(hermes_icm.STAGES["11"], "t-x", "full", "q", "/opt/hpr", skill, "")
     assert "2000-5000 words" in ctx11
     ctx145 = hermes_icm.render_context(hermes_icm.STAGES["14.5"], "t-x", "full", "q", "/opt/hpr", skill, "")
-    assert "at most **30 pairs**" in ctx145
+    assert "already done, by code" in ctx145
 
 
 def test_budget_config(hvault: Path):

@@ -8,6 +8,8 @@ This is a downstream fork of Jordan Gibbs's [hyperresearch](https://github.com/j
 - **Every role gets the cheapest model that can do it.** Fetching runs on a small model, analysis on a mid-tier one, and writing plus critique on the best one. The routing lives in one config file.
 - **Output lands where people read.** Finished runs publish into an Obsidian vault: the report goes in the project folder that asked for it, sources go in one shared library, and each run gets a sealed run record.
 
+The stage-folder design follows **ICM (Interpretable Context Methodology)** by Jake Van Clief: [github.com/RinDig/Interpretable-Context-Methodology](https://github.com/RinDig/Interpretable-Context-Methodology), [arXiv:2603.16021](https://arxiv.org/abs/2603.16021).
+
 Upstream's full documentation, covering the 16-step method, source ranking, scholarly search and the vault format, is kept at [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md). Everything there still applies.
 
 ---
@@ -81,6 +83,21 @@ All three passed the ship gate. Costs are estimated from token counts at list pr
 The older single-session runner is still available as `hpr hermes run`.
 
 ---
+
+### Intake: get the scope right first
+
+Runs are hands-off, so the scope has to be right before stage 1. `hpr hermes intake "<rough question>"` runs one small session that maps the question onto your prompt structure (`[hermes.intake] structure_file`; the built-in default is identity / task / context / constraints / output format) and either:
+
+- returns a finished research prompt plus the defaults it assumed, or
+- asks at most 3 clarifying questions, only where a wrong guess would change the research.
+
+Answer with `hpr hermes intake --id <id> --answers "..."`, then start with `hpr hermes icm --from-intake <id>`. `hpr hermes icm --intake "<question>"` does both in one go and stops (exit 3) only when it has questions. An intake pass costs a few cents.
+
+### Guards
+
+- **Locked files.** `hpr hermes install` records hashes and a clean copy of the step files, agent prompts, entry skill and both config files. A run won't start if they changed. After every stage, code restores anything an agent edited and logs it to `stages/guard.jsonl`. To change them on purpose, edit and re-run `hpr hermes install`.
+- **Stray files.** After every stage, files in the run folder that no step or agent names, and new files at the vault root, move to `stages/_strays/<stage>/`.
+- **Cite-check batching.** For step 14.5, code extracts citation pairs, splits them into batches of `cite_batch` (30), runs one checker per batch in parallel, and merges the findings. The stage session only applies them.
 
 ## Models
 
@@ -184,7 +201,8 @@ Safety guarantees:
 |---|---|
 | `hpr hermes install [PATH]` | Render prompts for Hermes; write `.hyperresearch/hermes.toml` if absent |
 | `hpr hermes models` | Show role → tier → model |
-| `hpr hermes icm QUERY [--tier] [--publish] [--project]` | ICM run: staged, code-sequenced |
+| `hpr hermes intake QUESTION` / `--id ID --answers ...` | Scope a question: finished prompt or up to 3 questions |
+| `hpr hermes icm QUERY [--intake \| --from-intake ID] [--tier] [--publish] [--project]` | ICM run: staged, code-sequenced |
 | `hpr hermes run QUERY [--tier]` | Single-session run (older runner) |
 | `hpr hermes publish TAG [--project]` | Publish a finished run to Obsidian |
 | `hpr hermes spawn --job AGENT=MSG_FILE …` | Launch subagents in parallel (used by stages) |
