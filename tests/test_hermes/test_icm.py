@@ -177,3 +177,41 @@ def test_gate_readout_matches_run_finish_shape():
     assert hermes_icm._gate_passed(ok)
     assert not hermes_icm._gate_passed(bad)
     assert hermes_icm._gate_failures(bad) == [{"name": "x", "ok": False}]
+
+
+def test_strip_markdown_keeps_prose_between_angle_brackets():
+    from hyperresearch.core.note import strip_markdown
+
+    t = "Clean when traffic is < 5 people and pets > 2 per home. <b>bold</b> <br/> <div class='x'>y</div>"
+    out = strip_markdown(t)
+    assert "< 5 people and pets > 2 per home" in out
+    assert "<b>" not in out and "<br/>" not in out and "<div" not in out and "bold" in out
+
+
+def test_trailing_slash_is_same_source(tmp_path: Path):
+    import sqlite3
+
+    from hyperresearch.core.fetcher import existing_live_note_for_url
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE sources (url TEXT, note_id TEXT)")
+    conn.execute("INSERT INTO sources VALUES ('https://x.org/PMC1', 'n1'), ('https://y.org/a/', 'n2')")
+    assert existing_live_note_for_url(conn, "https://x.org/PMC1/")["note_id"] == "n1"
+    assert existing_live_note_for_url(conn, "https://y.org/a")["note_id"] == "n2"
+    assert existing_live_note_for_url(conn, "https://x.org/PMC1?q=/") is None
+
+
+def test_draft_stage_rules(hvault: Path):
+    skill = (hvault / hermes.ENTRY_SKILL).read_text()
+    hermes_icm._WORD_TARGET["t-x"] = (2000, 5000)
+    ctx = hermes_icm.render_context(hermes_icm.STAGES["10"], "t-x", "full", "q", "/opt/hpr", skill, "")
+    assert "2000-5000 words" in ctx and "**12-20**" in ctx and "evidence-digest.md" in ctx
+    ctx11 = hermes_icm.render_context(hermes_icm.STAGES["11"], "t-x", "full", "q", "/opt/hpr", skill, "")
+    assert "2000-5000 words" in ctx11
+    ctx145 = hermes_icm.render_context(hermes_icm.STAGES["14.5"], "t-x", "full", "q", "/opt/hpr", skill, "")
+    assert "at most **30 pairs**" in ctx145
+
+
+def test_budget_config(hvault: Path):
+    assert hermes.load_config(hvault).max_cost_usd == 0

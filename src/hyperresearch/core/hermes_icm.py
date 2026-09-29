@@ -162,6 +162,7 @@ STAGES: dict[str, Stage] = {
         "10", "draft",
         loads=[*_BASE, _SHIMS + "drafting.md", "@draft-inputs"],
         outputs=["@draft"],
+        extra="@draft-rules",
     ),
     "11": Stage(
         "11", "synthesize",
@@ -169,6 +170,7 @@ STAGES: dict[str, Stage] = {
                _T + "source-tensions.json", R + "/comparisons.md"],
         outputs=[REPORT, _T + "synthesis-pass1.md"],
         avoid=[_NO_BULK],
+        extra="@length",
     ),
     "12": Stage(
         "12", "critics",
@@ -195,6 +197,13 @@ STAGES: dict[str, Stage] = {
         loads=[*_BASE, REPORT],
         outputs=[R + "/cite-check-pairs.json", R + "/cite-check-findings.json"],
         avoid=[_NO_BULK],
+        extra=(
+            "**Cite-checker batching (this runtime, overrides the step's one-or-two rule):** split "
+            "`sampled_for_llm` into batches of at most **30 pairs**, one `hyperresearch-cite-checker` "
+            "per batch, all launched in ONE `hpr hermes spawn` call. Give each checker its own index "
+            "range and findings file (`cite-check-findings-<n>.json`), then merge them into "
+            "`cite-check-findings.json`. Small batches keep each checker's session short."
+        ),
     ),
     "15": Stage("15", "polish", loads=[R + "/query.md", REPORT, _SHIMS + "polish.md"], outputs=[R + "/polish-log.json"]),
     "16": Stage("16", "readability-audit", loads=[R + "/query.md", REPORT], outputs=[R + "/readability-recommendations.json"]),
@@ -205,6 +214,30 @@ _DRAFT_INPUTS = {
     "full": [_T + "evidence-digest.md", _T + "source-tensions.json", R + "/comparisons.md",
              R + "/loci.json", _T + "orchestrator-notes.md"],
 }
+
+
+# vault_tag -> (low, high) word target, filled in once stage 1 has classified
+# the response format. Module-level so render_context stays a pure function
+# of its arguments plus this lookup.
+_WORD_TARGET: dict[str, tuple[int, int]] = {}
+
+# After these stages code runs the mechanical checks that caused expensive
+# end-of-run fixes, and fixes them right there in a small session.
+CHECKPOINTS = {"11": ("length-in-range",), "14": ("length-in-range",),
+               "14.5": ("quote-integrity",), "10": ("length-in-range",)}
+
+
+def word_target(vault_root: Path, tag: str, tier: str) -> tuple[int, int] | None:
+    try:
+        from hyperresearch.core.profiles import resolve_profile
+
+        decomp = json.loads((vault_root / R.format(tag=tag) / "prompt-decomposition.json").read_text())
+        fmt = decomp.get("response_format")
+        prof = resolve_profile("full" if tier == "full" else "light", vault_root / ".hyperresearch" / "config.toml")
+        lo, hi = prof.word_targets[fmt]
+        return int(lo), int(hi)
+    except Exception:
+        return None
 
 
 def stage_tier(cfg: hermes.HermesConfig, step: str, tier: str) -> str:
@@ -271,6 +304,24 @@ def render_context(stage: Stage, tag: str, tier: str, query: str, hpr: str, skil
         *(fmt(a) for a in stage.avoid),
     ]
     extra = stage.extra
+    if extra in ("@draft-rules", "@length"):
+        lo_hi = _WORD_TARGET.get(tag)
+        length = (
+            f"**Length (checked by code right after this stage):** the final report must land at "
+            f"**{lo_hi[0]}-{lo_hi[1]} words**. Aim for about {int((lo_hi[0] + lo_hi[1]) / 2)}."
+            if lo_hi else ""
+        )
+    if extra == "@draft-rules":
+        extra = "\n\n".join(x for x in (
+            length and length + " Pass this target to every draft-orchestrator; each draft must fit it.",
+            "**Draft reading budget (this runtime, overrides the step's 20-50):** give each "
+            "draft-orchestrator **12-20** `must_read_note_ids`, and tell it to read "
+            f"`research/runs/{tag}/temp/evidence-digest.md` first, then only its must-read notes. "
+            "No vault survey, no extra notes. The digest already carries the claims; the notes are for "
+            "quoting and detail.",
+        ) if x)
+    elif extra == "@length":
+        extra = length + (" Tell the synthesizer this target explicitly." if length else "")
     if extra == "@bootstrap":
         extra = (
             "**Before the procedure, finish the bootstrap** (code already minted the vault tag, "
@@ -495,6 +546,22 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
             _hpr_json(hpr, ["run", "block", tag, "--on", f"stage-{step}-outputs"], vault_root)
             return _summary(vault_root, tag, tier, results, None, hpr)
         _hpr_json(hpr, ["run", "step", tag, step, "--status", "done"], vault_root)
+        if step == "1":
+            wt = word_target(vault_root, tag, tier)
+            if wt:
+                _WORD_TARGET[tag] = wt
+        if step in CHECKPOINTS and not (step == "10" and tier == "full"):
+            fixed = _checkpoint(vault_root, cfg, tag, step, CHECKPOINTS[step], hpr, stages_dir, skill_text, echo)
+            if fixed:
+                rows.append(fixed)
+                _write_index(vault_root, tag, tier, rows, sealed=False)
+        spent = _spent(vault_root, tag)
+        if cfg.max_cost_usd and spent is not None and spent > cfg.max_cost_usd:
+            echo(f"  budget: ~${spent:.2f} > max_cost_usd ${cfg.max_cost_usd:.2f}; stopping")
+            _hpr_json(hpr, ["run", "block", tag, "--on", "budget"], vault_root)
+            rows.append({"stage": "BUDGET STOP", "status": f"~${spent:.2f} > ${cfg.max_cost_usd:.2f}"})
+            _write_index(vault_root, tag, tier, rows, sealed=False)
+            return _summary(vault_root, tag, tier, results, None, hpr)
 
         if step == "1" and tier == "auto":
             try:
@@ -556,6 +623,74 @@ def _gate_failures(gate: dict | None) -> object:
         or [c for c in (data.get("verify") or {}).get("checks", []) if not c.get("ok")]
         or (gate or {}).get("error")
     )
+
+
+def _spent(vault_root: Path, tag: str) -> float | None:
+    """Estimated spend so far from the run ledger and [hermes.prices]; None if unpriced."""
+    from hyperresearch.core import hermes_publish
+
+    prices = hermes_publish.load_publish_config(vault_root).prices
+    ledger = vault_root / R.format(tag=tag) / "temp" / "hermes-spawns.jsonl"
+    if not prices or not ledger.exists():
+        return None
+    total = 0.0
+    for line in ledger.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        c = hermes_publish.estimate_cost(r.get("tokens") or {}, prices.get(r.get("model", "")))
+        if c is None:
+            return None
+        total += c
+    return total
+
+
+def _checkpoint(vault_root, cfg, tag, step, checks, hpr, stages_dir, skill_text, echo) -> dict | None:
+    """Run named mechanical checks now; fix failures in one small, focused session."""
+    if not (vault_root / REPORT.format(tag=tag)).exists():
+        return None
+    v = _hpr_json(hpr, ["run", "verify", tag], vault_root).get("data") or {}
+    failed = [c for c in v.get("checks", []) if c.get("name") in checks and not c.get("ok")]
+    if not failed:
+        return None
+    detail = failed
+    if any(c["name"] == "quote-integrity" for c in failed):
+        lint = _hpr_json(hpr, ["lint", "--rule", "quote-integrity", "--audit-file", REPORT.format(tag=tag)], vault_root)
+        detail = failed + [{"quote": i.get("message", "")[:300]} for i in (lint.get("data") or {}).get("issues", [])]
+    echo(f"    checkpoint after {step}: {[c['name'] for c in failed]}; fixing")
+    d = stages_dir / f"{int(float(step)):02d}{'_5' if step.endswith('.5') else ''}_checkpoint"
+    d.mkdir(exist_ok=True)
+    lo_hi = _WORD_TARGET.get(tag)
+    ctx = d / "CONTEXT.md"
+    ctx.write_text(
+        f"# Checkpoint after stage {step}\n\nRun `{tag}`. Report: `{REPORT.format(tag=tag)}`.\n"
+        f"Code ran mechanical checks and these failed:\n\n```json\n{json.dumps(detail, indent=1)[:5000]}\n```\n\n"
+        "Fix only these, then stop:\n\n"
+        + ("- **Length:** spawn ONE `hyperresearch-synthesizer` compression pass "
+           f"(`{hpr} hermes spawn --tag {tag} --job hyperresearch-synthesizer=<msg file> -j`) with the report path, "
+           f"the target ({lo_hi[0]}-{lo_hi[1]} words, aim {int(sum(lo_hi) / 2)}) and the rule: cut repetition and "
+           "weaker supporting evidence, keep every load-bearing claim and citation, keep all H2s. Then confirm "
+           "with `wc -w`.\n" if lo_hi and any(c["name"] == "length-in-range" for c in failed) else "")
+        + ("- **Quotes:** for each flagged quote, `hpr search` the phrase; if the source has the exact words, "
+           "copy them verbatim; otherwise remove the quotation marks and keep the claim as plain prose. "
+           "Surgical `patch` edits only.\n" if any(c["name"] == "quote-integrity" for c in failed) else "")
+        + f"\nWhen done, `{hpr} run verify {tag} --json` must show these checks ok.\n",
+        encoding="utf-8",
+    )
+    t0 = time.monotonic()
+    code, res = _run_session(vault_root, cfg, cfg.orchestrator_tier, ["file", "terminal"], ctx, d / "session.log.jsonl")
+    _ledger(vault_root, tag, {
+        "agent": f"stage-{step}-checkpoint", "role": "stage", "tier": cfg.orchestrator_tier,
+        "model": cfg.tier(cfg.orchestrator_tier).model, "status": "done", "exit_code": code,
+        "tokens": res.get("tokens"), "duration_ms": int((time.monotonic() - t0) * 1000),
+    })
+    after = _hpr_json(hpr, ["run", "verify", tag], vault_root).get("data") or {}
+    still = [c["name"] for c in after.get("checks", []) if c.get("name") in checks and not c.get("ok")]
+    echo(f"    checkpoint {'ok' if not still else 'still failing ' + str(still)}")
+    return {"stage": f"{step} checkpoint", "status": "fixed" if not still else f"still {still}",
+            "model": cfg.tier(cfg.orchestrator_tier).model,
+            "minutes": round((time.monotonic() - t0) / 60, 1), "tokens": (res.get("tokens") or {}).get("total")}
 
 
 def _summary(vault_root: Path, tag: str, tier: str, results: list[StageResult], gate: dict | None, hpr: str) -> dict:

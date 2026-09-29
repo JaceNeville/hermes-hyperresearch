@@ -163,6 +163,8 @@ def strip_markdown(text: str) -> str:
     text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
     text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
     text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"<[^>]+>", "", text)
+    # Fork: only real tags. `<[^>]+>` also ate prose like "< 12 months ... >",
+    # which made verbatim quotes fail the quote-integrity check.
+    text = re.sub(r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()

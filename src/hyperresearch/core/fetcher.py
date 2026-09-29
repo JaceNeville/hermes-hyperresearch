@@ -16,10 +16,16 @@ def existing_live_note_for_url(conn: sqlite3.Connection, url: str) -> sqlite3.Ro
     when it is orphaned. Every duplicate-url check must go through here rather
     than testing row truthiness.
     """
-    row = conn.execute("SELECT note_id FROM sources WHERE url = ?", (url,)).fetchone()
-    if row is None or row["note_id"] is None:
-        return None
-    return row
+    # Fork: `.../PMC4035666` and `.../PMC4035666/` are one page; check both forms
+    # so a trailing slash can't put the same source in the vault twice.
+    variants = [url]
+    if "?" not in url and "#" not in url:
+        variants.append(url[:-1] if url.endswith("/") else url + "/")
+    for u in variants:
+        row = conn.execute("SELECT note_id FROM sources WHERE url = ?", (u,)).fetchone()
+        if row is not None and row["note_id"] is not None:
+            return row
+    return None
 
 
 def reclaim_orphaned_source_row(

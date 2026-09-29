@@ -74,6 +74,9 @@ max_parallel = 6
 min_parallel = 1
 per_agent_mb = 260
 reserve_mb = 700
+# ICM runs stop (blocked, resumable) once estimated spend passes this, in USD.
+# Needs [hermes.prices]. 0 = no ceiling.
+max_cost_usd = 0
 # Hard wall-clock cap per subagent, seconds.
 spawn_timeout_s = 1800
 # Tool-call iteration cap per subagent.
@@ -155,6 +158,7 @@ class HermesConfig:
     min_parallel: int = 1
     per_agent_mb: int = 260
     reserve_mb: int = 700
+    max_cost_usd: float = 0.0
     spawn_timeout_s: int = 1800
     max_turns: int = 120
     extra_args: list[str] = field(default_factory=list)
@@ -192,6 +196,7 @@ def load_config(vault_root: Path) -> HermesConfig:
         per_agent_mb=int(data.get("per_agent_mb", defaults["per_agent_mb"])),
         reserve_mb=int(data.get("reserve_mb", defaults["reserve_mb"])),
         spawn_timeout_s=int(data.get("spawn_timeout_s", defaults["spawn_timeout_s"])),
+        max_cost_usd=float(data.get("max_cost_usd", defaults["max_cost_usd"])),
         max_turns=int(data.get("max_turns", defaults["max_turns"])),
         extra_args=list(data.get("extra_args", defaults["extra_args"])),
         tiers=tiers,
