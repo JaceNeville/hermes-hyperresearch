@@ -603,18 +603,62 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+def missing_outputs(vault_root: Path, expects: list[str]) -> list[str]:
+    """Expected output files that don't exist or are empty."""
+    out = []
+    for rel in expects:
+        f = vault_root / rel
+        try:
+            if f.stat().st_size == 0:
+                out.append(rel)
+        except OSError:
+            out.append(rel)
+    return out
+
+
+def write_blocked_reason(vault_root: Path, env: dict[str, str] | None = None) -> str | None:
+    """Why Hermes' file tools can't write the vault here, or None if they can.
+
+    Hermes refuses every write outside HERMES_WRITE_SAFE_ROOT. Container
+    images set it (the official one: /opt/data), so a vault elsewhere gets
+    silent per-call denials: agents improvise around them or skip their
+    output. Checked before a run starts, not discovered mid-run.
+    """
+    env = os.environ if env is None else env
+    roots = [r for r in (env.get("HERMES_WRITE_SAFE_ROOT") or "").split(os.pathsep) if r]
+    if not roots:
+        return None
+    v = Path(vault_root).resolve()
+    for r in roots:
+        try:
+            if v.is_relative_to(Path(r).resolve()):
+                return None
+        except OSError:
+            continue
+    return (f"HERMES_WRITE_SAFE_ROOT={env.get('HERMES_WRITE_SAFE_ROOT')} excludes the vault {v}; "
+            "every agent write would be denied. Add the vault to it (or unset it) before running.")
+
+
 def _batch_dir(vault_root: Path, batch_id: str) -> Path:
     return vault_root / BATCHES_DIR / batch_id
 
 
-def create_batch(vault_root: Path, jobs: list[tuple[str, Path]], tag: str | None) -> str:
-    """Validate jobs, write prompts + batch.json, return the batch id."""
+def create_batch(vault_root: Path, jobs: list[tuple], tag: str | None) -> str:
+    """Validate jobs, write prompts + batch.json, return the batch id.
+
+    A job is ``(agent, message_path)`` or ``(agent, message_path, expects)``
+    where ``expects`` lists vault-relative files the agent promises to write.
+    A job that exits 0 without them is marked ``failed`` (missing_outputs),
+    never ``done``: an agent's word is not a handoff; the file is.
+    """
     cfg = load_config(vault_root)
     batch_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:6]
     bdir = _batch_dir(vault_root, batch_id)
     bdir.mkdir(parents=True)
     records = []
-    for i, (agent, msg_path) in enumerate(jobs):
+    for i, job_spec in enumerate(jobs):
+        agent, msg_path = job_spec[0], job_spec[1]
+        expects = [str(e) for e in (job_spec[2] if len(job_spec) > 2 else [])]
         meta, body = load_agent(vault_root, agent)
         msg_path = (vault_root / msg_path) if not msg_path.is_absolute() else msg_path
         if not msg_path.is_file():
@@ -636,6 +680,7 @@ def create_batch(vault_root: Path, jobs: list[tuple[str, Path]], tag: str | None
             "message_file": str(msg_path.relative_to(vault_root)) if msg_path.is_relative_to(vault_root) else str(msg_path),
             "prompt_file": str(prompt.relative_to(vault_root)),
             "log_file": str((bdir / f"{i:02d}-{agent}.log.jsonl").relative_to(vault_root)),
+            "expects": expects,
             "status": "queued",
         })
     batch = {"batch_id": batch_id, "tag": tag, "created": _now(), "status": "queued", "jobs": records}
@@ -753,6 +798,10 @@ def run_batch(vault_root: Path, batch_id: str) -> None:
             res = _parse_result(vault_root / job["log_file"])
             code = proc.returncode
             ok = code == 0 and not timed_out and bool(res)
+            missing = missing_outputs(vault_root, job.get("expects") or [])
+            if missing:
+                job["missing_outputs"] = missing
+                ok = False
             job.update(
                 status="done" if ok else ("timed_out" if timed_out else "failed"),
                 exit_code=code,

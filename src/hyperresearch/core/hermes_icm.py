@@ -486,6 +486,9 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print,
             + ". Review them; if the change is intended re-run `hpr hermes install`, otherwise "
             "`hpr hermes install` also restores the originals."
         )
+    blocked = hermes.write_blocked_reason(vault_root)
+    if blocked:
+        raise hermes.HermesError(blocked)
     cfg = hermes.load_config(vault_root)
     skill_text = (vault_root / hermes.ENTRY_SKILL).read_text(encoding="utf-8")
 
@@ -551,6 +554,11 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print,
             pre = cite_precheck(vault_root, cfg, tag, hpr, sdir, echo)
             rows.append(pre)
             _write_index(vault_root, tag, tier, rows, sealed=False)
+            if pre.get("missing_batches"):
+                # A patch pass on partial findings looks finished but isn't: stop, resumable.
+                echo(f"  cite-check batches {pre['missing_batches']} produced no findings after a retry; stopping")
+                _hpr_json(hpr, ["run", "block", tag, "--on", "stage-14.5-cite-checkers"], vault_root)
+                return _summary(vault_root, tag, tier, results, None, hpr)
         echo(f"  stage {step} {stage.title} ({cfg.tier(tier_name).model}) ...")
         root_before = hermes_guard.snapshot_root(vault_root)
         t0 = time.monotonic()
@@ -740,25 +748,34 @@ def cite_precheck(vault_root: Path, cfg: hermes.HermesConfig, tag: str, hpr: str
             f"- findings_path: {out}\n- vault_tag: {tag}\n",
             encoding="utf-8",
         )
-        jobs.append(("hyperresearch-cite-checker", msg))
-    failed = []
+        jobs.append(("hyperresearch-cite-checker", msg, [out]))
+
+    def _read(n: int) -> list | None:
+        try:
+            part = json.loads((run_dir / f"cite-check-findings-{n}.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return part if isinstance(part, list) else None
+
+    failed: list[int] = []
     if jobs:
-        batch_id = hermes.create_batch(vault_root, jobs, tag)
-        hermes.start_batch_detached(vault_root, batch_id)
-        summary = hermes.wait_batch(vault_root, batch_id, cfg.spawn_timeout_s + 120)
-        for n, _ in enumerate(batches, 1):
-            f = run_dir / f"cite-check-findings-{n}.json"
-            try:
-                part = json.loads(f.read_text(encoding="utf-8"))
-                findings += part if isinstance(part, list) else []
-            except (OSError, json.JSONDecodeError):
-                failed.append(n)
-        echo(f"    checkers: {summary['counts']}, peak parallel {summary.get('peak_parallel')}"
-             + (f"; no findings file from batch(es) {failed}" if failed else ""))
+        todo = list(range(1, len(jobs) + 1))
+        for attempt in (1, 2):  # one retry for batches that left no valid findings file
+            batch_id = hermes.create_batch(vault_root, [jobs[n - 1] for n in todo], tag)
+            hermes.start_batch_detached(vault_root, batch_id)
+            summary = hermes.wait_batch(vault_root, batch_id, cfg.spawn_timeout_s + 120)
+            todo = [n for n in todo if _read(n) is None]
+            echo(f"    checkers (attempt {attempt}): {summary['counts']}, peak parallel "
+                 f"{summary.get('peak_parallel')}" + (f"; no findings file from batch(es) {todo}" if todo else ""))
+            if not todo:
+                break
+        failed = todo
+        for n in range(1, len(jobs) + 1):
+            findings += _read(n) or []
     (run_dir / "cite-check-findings.json").write_text(json.dumps(findings, indent=1) + "\n", encoding="utf-8")
     return {"stage": "14.5 pre-check (code)", "status": f"{len(batches)} batches, {len(findings)} findings"
             + (f", batches {failed} missing" if failed else ""), "model": "code + cite-checkers",
-            "minutes": round((time.monotonic() - t0) / 60, 1), "tokens": ""}
+            "minutes": round((time.monotonic() - t0) / 60, 1), "tokens": "", "missing_batches": failed}
 
 
 def _gate_passed(gate: dict | None) -> bool:

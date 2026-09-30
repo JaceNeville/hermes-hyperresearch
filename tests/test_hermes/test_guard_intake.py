@@ -241,3 +241,61 @@ def test_resume_skips_done_steps_and_reuses_handoffs(hvault: Path, monkeypatch):
 def test_resume_refuses_unknown_run(hvault: Path):
     with pytest.raises(hermes.HermesError, match="no resumable ICM run"):
         hermes_icm.run_icm(hvault, "(resumed)", "full", "/opt/hpr", echo=lambda *_: None, resume_tag="nope-000000")
+
+
+# --- handoff contract: outputs, not exit codes ---------------------------------
+
+
+def test_write_blocked_reason(tmp_path: Path):
+    v = tmp_path / "vault"
+    v.mkdir()
+    assert hermes.write_blocked_reason(v, {}) is None
+    assert hermes.write_blocked_reason(v, {"HERMES_WRITE_SAFE_ROOT": str(tmp_path)}) is None
+    both = os.pathsep.join(["/opt/data", str(v)])
+    assert hermes.write_blocked_reason(v, {"HERMES_WRITE_SAFE_ROOT": both}) is None
+    why = hermes.write_blocked_reason(v, {"HERMES_WRITE_SAFE_ROOT": "/opt/data"})
+    assert why and "excludes the vault" in why
+
+
+def test_run_refuses_when_vault_not_writable(hvault: Path, monkeypatch):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/opt/data")
+    with pytest.raises(hermes.HermesError, match="excludes the vault"):
+        hermes_icm.run_icm(hvault, "q", "light", "/opt/hpr", echo=lambda *_: None)
+
+
+def test_missing_outputs(tmp_path: Path):
+    (tmp_path / "a.json").write_text("[]")
+    (tmp_path / "empty.json").write_text("")
+    assert hermes.missing_outputs(tmp_path, ["a.json", "empty.json", "gone.json"]) == ["empty.json", "gone.json"]
+
+
+def test_batch_job_without_promised_output_is_failed(hvault: Path, monkeypatch):
+    """Exit 0 + a result event is not enough: the promised file must exist."""
+    import subprocess as sp
+
+    msg = hvault / "msg.md"
+    msg.write_text("do it")
+    agent = "hyperresearch-cite-checker"
+    bid = hermes.create_batch(hvault, [(agent, msg, ["research/out-ok.json"]),
+                                       (agent, msg, ["research/out-missing.json"])], None)
+    (hvault / "research" / "out-ok.json").write_text("[]")
+
+    class P:
+        pid, returncode = 1, 0
+
+        def poll(self):
+            return 0
+
+    def fake_popen(cmd, stdout=None, **kw):
+        stdout.write(json.dumps({"type": "result", "text": "done", "tokens": {}}) + "\n")
+        stdout.flush()
+        return P()
+
+    monkeypatch.setattr(hermes.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(hermes.time, "sleep", lambda s: None)
+    monkeypatch.setattr(hermes, "_ledger", lambda *a: None)
+    hermes.run_batch(hvault, bid)
+    jobs = hermes._load_batch(hvault, bid)["jobs"]
+    assert [j["status"] for j in jobs] == ["done", "failed"]
+    assert jobs[1]["missing_outputs"] == ["research/out-missing.json"]
+    assert sp  # keep import for readability of the fake
