@@ -475,7 +475,8 @@ def _write_index(vault_root: Path, tag: str, tier: str, rows: list[dict], sealed
     (vault_root / R.format(tag=tag) / "stages" / "RUN.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> dict:
+def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print,
+            resume_tag: str | None = None) -> dict:
     from hyperresearch.core import hermes_guard as _g
 
     changed = _g.changed_files(vault_root)
@@ -489,17 +490,32 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
     skill_text = (vault_root / hermes.ENTRY_SKILL).read_text(encoding="utf-8")
 
     # --- bootstrap, in code -------------------------------------------------
-    tag = _hpr_json(hpr, ["vault-tag", slugify(query)], vault_root)["data"]["vault_tag"]
-    run_dir = vault_root / R.format(tag=tag)
-    stages_dir = run_dir / "stages"
-    stages_dir.mkdir(parents=True, exist_ok=True)
-    qfile = stages_dir / "query.txt"
-    qfile.write_text(query.strip() + "\n", encoding="utf-8")
-    init = _hpr_json(hpr, ["run", "init", tag, "--profile", "full" if tier == "full" else "light",
-                           "--query-file", str(qfile)], vault_root)
-    if not init.get("ok"):
-        raise hermes.HermesError(f"run init failed: {init.get('error')}")
-    echo(f"run {tag}: {run_dir.relative_to(vault_root)}")
+    done_before: set[str] = set()
+    if resume_tag:
+        # Resume a stopped run (budget stop, crash): finished steps are skipped,
+        # their handoffs reload, spend so far still counts against the cap.
+        tag = resume_tag
+        run_dir = vault_root / R.format(tag=tag)
+        stages_dir = run_dir / "stages"
+        manifest = run_dir / "run.json"
+        if not manifest.exists() or not (stages_dir / "query.txt").exists():
+            raise hermes.HermesError(f"no resumable ICM run at {run_dir}")
+        done_before = {k for k, v in (json.loads(manifest.read_text()).get("steps") or {}).items()
+                       if isinstance(v, dict) and v.get("status") == "done"}
+        query = (stages_dir / "query.txt").read_text(encoding="utf-8")
+        echo(f"resume {tag}: {len(done_before)} step(s) already done")
+    else:
+        tag = _hpr_json(hpr, ["vault-tag", slugify(query)], vault_root)["data"]["vault_tag"]
+        run_dir = vault_root / R.format(tag=tag)
+        stages_dir = run_dir / "stages"
+        stages_dir.mkdir(parents=True, exist_ok=True)
+        qfile = stages_dir / "query.txt"
+        qfile.write_text(query.strip() + "\n", encoding="utf-8")
+        init = _hpr_json(hpr, ["run", "init", tag, "--profile", "full" if tier == "full" else "light",
+                               "--query-file", str(qfile)], vault_root)
+        if not init.get("ok"):
+            raise hermes.HermesError(f"run init failed: {init.get('error')}")
+        echo(f"run {tag}: {run_dir.relative_to(vault_root)}")
 
     from hyperresearch.core import hermes_guard
 
@@ -514,6 +530,17 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print) -> di
         stage = STAGES[step]
         sdir = stages_dir / f"{int(float(step)):02d}{'_5' if step.endswith('.5') else ''}_{stage.title}"
         sdir.mkdir(exist_ok=True)
+        if step in done_before:
+            prev = sdir / "handoff.md"
+            handoffs.append(f"### Stage {step} — {stage.title}\n"
+                            + (prev.read_text(encoding="utf-8").strip() if prev.exists() else ""))
+            rows.append({"stage": f"{step} {stage.title}", "status": "done (earlier)"})
+            if step == "1":
+                wt = word_target(vault_root, tag, tier)
+                if wt:
+                    _WORD_TARGET[tag] = wt
+            i += 1
+            continue
         ctx = render_context(stage, tag, tier, query, hpr, skill_text, "\n\n".join(handoffs[-3:]))
         (sdir / "CONTEXT.md").write_text(ctx, encoding="utf-8")
         tier_name = stage_tier(cfg, step, tier)

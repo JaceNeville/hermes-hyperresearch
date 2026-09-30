@@ -249,6 +249,7 @@ def icm(
     tier: str | None = typer.Option(None, "--tier", help="light | full | auto (default: hermes.toml default_tier)."),
     publish: bool = typer.Option(False, "--publish", help="Publish to the Obsidian vault when the gate passes."),
     project: str | None = typer.Option(None, "--project", help="Obsidian project folder the report belongs to."),
+    resume: str | None = typer.Option(None, "--resume", help="Continue a stopped run (vault tag); finished steps are skipped."),
     json_output: bool = typer.Option(False, "--json", "-j"),
 ) -> None:
     """Run the pipeline ICM-style: code sequences stages, each a fresh session."""
@@ -273,6 +274,8 @@ def icm(
             _emit_intake(res, vault, json_output)
             raise typer.Exit(3)
         query, intake_tier = res.prompt, res.tier or None
+    if resume:
+        query = query or "(resumed)"
     if not query or not query.strip():
         _fail("empty research query", "NO_QUERY", json_output)
     try:
@@ -281,7 +284,8 @@ def icm(
         if tier_cap not in ("light", "full", "auto"):
             _fail("--tier must be light, full, or auto", "BAD_TIER", json_output)
         echo = (lambda *_: None) if json_output else (lambda m: console.print(m))
-        data = hermes_icm.run_icm(vault.root, query, tier_cap, _resolve_executable(), echo=echo)
+        data = hermes_icm.run_icm(vault.root, query, tier_cap, _resolve_executable(), echo=echo,
+                                  resume_tag=resume)
     except hermes.HermesError as e:
         _fail(str(e), "ICM_ERROR", json_output)
     data["spend"] = _spawn_spend(vault.root, data["vault_tag"])

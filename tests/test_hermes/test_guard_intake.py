@@ -197,3 +197,47 @@ def test_intake_structure_file_config(hvault: Path, tmp_path: Path):
 def test_gate_output_is_never_a_stray(tmp_path):
     from hyperresearch.core import hermes_guard
     assert hermes_guard.allowed_run_names(tmp_path).match("grounding.json")
+
+
+def test_resume_skips_done_steps_and_reuses_handoffs(hvault: Path, monkeypatch):
+    """--resume: finished steps don't re-run; their handoffs feed the next stage."""
+    tag = "resume-me-abc123"
+    run_dir = hvault / hermes_icm.R.format(tag=tag)
+    stages = run_dir / "stages"
+    stages.mkdir(parents=True)
+    (stages / "query.txt").write_text("the original question\n")
+    steps = hermes_icm.TIER_STEPS["light"]
+    done = steps[:-1]
+    (run_dir / "run.json").write_text(json.dumps(
+        {"status": "running", "steps": {s: {"status": "done"} for s in done}}))
+    first = hermes_icm.STAGES[done[0]]
+    d = stages / f"{int(float(done[0])):02d}_{first.title}"
+    d.mkdir()
+    (d / "handoff.md").write_text("EARLIER-HANDOFF")
+
+    ran, contexts = [], []
+    monkeypatch.setattr(hermes_icm, "_hpr_json", lambda hpr, args, cwd: {"ok": True, "data": {}})
+    monkeypatch.setattr(hermes_icm, "word_target", lambda *a: None)
+
+    def fake_session(vault_root, cfg, tier_name, toolsets, prompt_file, log, resume=None):
+        ran.append(prompt_file.parent.name)
+        contexts.append(prompt_file.read_text())
+        return 0, {"text": "handoff", "tokens": {}, "session_id": "s"}
+
+    monkeypatch.setattr(hermes_icm, "_run_session", fake_session)
+    monkeypatch.setattr(hermes_icm, "_check_outputs", lambda *a: [])
+    monkeypatch.setattr(hermes_icm, "_checkpoint", lambda *a: None)
+    monkeypatch.setattr(hermes_icm, "_spent", lambda *a: None)
+    monkeypatch.setattr(hermes_icm, "_gate_passed", lambda g: True)
+    monkeypatch.setattr(hermes_icm, "_summary", lambda *a: {"vault_tag": a[1]})
+
+    out = hermes_icm.run_icm(hvault, "(resumed)", "light", "/opt/hpr", echo=lambda *_: None, resume_tag=tag)
+    assert out["vault_tag"] == tag
+    last = hermes_icm.STAGES[steps[-1]]
+    assert ran == [f"{int(float(steps[-1])):02d}_{last.title}"]
+    assert "the original question" in contexts[0]
+
+
+def test_resume_refuses_unknown_run(hvault: Path):
+    with pytest.raises(hermes.HermesError, match="no resumable ICM run"):
+        hermes_icm.run_icm(hvault, "(resumed)", "full", "/opt/hpr", echo=lambda *_: None, resume_tag="nope-000000")
