@@ -654,6 +654,12 @@ def run_icm(vault_root: Path, query: str, tier: str, hpr: str, echo=print,
             "quote/attribution or the whole sentence. Never invent a replacement and never add a citation "
             "you have not opened. A report that says less is acceptable; a report that says something its "
             "sources don't is not.\n\n"
+            "**`vacuous`** means the check found no citation it could read. Every factual sentence needs a "
+            "`[[note-id]]` link (or a numbered `[N]` whose `## Sources` entry has the note's exact source URL). "
+            "Add citations only to notes you have opened that state the fact; delete sentences no note supports.\n"
+            "**`dangling` `unresolved-citation-N`** means source [N] in the Sources list has no matching vault "
+            "note (never fetched, or its URL differs). Re-cite to a vault note that states the fact, or delete "
+            "the claim. Never fix it by editing the Sources URL to point at a different document.\n\n"
             + _section(skill_text, "**The gate's verdict is final.", "Ship only after")
             + "\n",
             encoding="utf-8",
@@ -720,7 +726,7 @@ def cite_precheck(vault_root: Path, cfg: hermes.HermesConfig, tag: str, hpr: str
     gres = grounding.check_file(vault_root, report)
     grounding.write_findings(run_dir / "grounding.json", gres)
     for f in gres.findings:
-        if f.kind == "dangling":
+        if f.kind in ("dangling", "vacuous"):   # vacuous is whole-report; the ship gate handles it
             continue
         findings.append({
             "verdict": "unsupported", "severity": "critical", "sentence": f.sentence,

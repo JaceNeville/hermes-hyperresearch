@@ -76,3 +76,65 @@ def test_table_row_checked_as_one_unit():
 
 def test_standard_names_and_small_numbers_not_flagged():
     assert run("IICRC S100 and CRI 205 both say clean every 18 months [[stainmaster]].").ok
+
+
+# --- numbered [N] citations (citation_style "inline") ------------------------
+# A light run once cited with [N] markers; the gate saw 0 cited sentences and
+# passed it as "grounded". These keep that from happening again.
+
+def _vault(tmp_path, notes: dict[str, tuple[str, str]]):
+    d = tmp_path / "research" / "notes"
+    d.mkdir(parents=True)
+    for nid, (url, body) in notes.items():
+        (d / f"{nid}.md").write_text(f"---\ntitle: {nid}\nsource: {url}\n---\n{body}\n", encoding="utf-8")
+    return tmp_path
+
+
+def _report(tmp_path, text: str):
+    p = tmp_path / "report.md"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+NOTES = {
+    "akamai": ("https://www.akamai.com/cloud/pricing/north-america", "Nanode 1 GB costs $5.00 per month."),
+    "do": ("https://www.digitalocean.com/pricing/droplets/", "Basic 1 GiB droplet is $6.00 a month."),
+}
+
+
+def test_numbered_citations_are_checked(tmp_path):
+    v = _vault(tmp_path, NOTES)
+    rep = _report(tmp_path, "# R\n\nA Nanode is $5 a month [1]. A droplet is $9 a month [2].\n\n"
+                            "## Sources\n\n[1] Akamai. https://akamai.com/cloud/pricing/north-america\n"
+                            "[2] DO. https://www.digitalocean.com/pricing/droplets (checked 2026-10-02)\n")
+    r = g.check_file(v, rep)
+    assert r.cited_sentences == 2
+    assert [f.kind for f in r.findings] == ["number"] and r.findings[0].missing == ["9"]
+
+
+def test_grouped_numbered_citation_and_lettered_source_heading(tmp_path):
+    v = _vault(tmp_path, NOTES)
+    rep = _report(tmp_path, "Prices run $5 to $6 [1, 2].\n\n## H. Source List\n\n"
+                            "[1] A. https://www.akamai.com/cloud/pricing/north-america\n[2] D. https://www.digitalocean.com/pricing/droplets\n")
+    r = g.check_file(v, rep)
+    assert r.cited_sentences == 1 and r.ok
+
+
+def test_numbered_citation_without_a_vault_note_fails_closed(tmp_path):
+    v = _vault(tmp_path, NOTES)
+    rep = _report(tmp_path, "DORA found something [3].\n\n## Sources\n\n[3] DORA. https://dora.dev/never-fetched.pdf\n")
+    r = g.check_file(v, rep)
+    assert [f.kind for f in r.findings] == ["dangling"]
+
+
+def test_report_with_no_readable_citations_is_not_grounded(tmp_path):
+    v = _vault(tmp_path, NOTES)
+    rep = _report(tmp_path, "# R\n\nEverything is cheap. No citations at all.\n")
+    r = g.check_file(v, rep)
+    assert not r.ok and r.findings[0].kind == "vacuous"
+
+
+def test_section_titled_sources_of_x_is_not_the_source_list(tmp_path):
+    v = _vault(tmp_path, NOTES)
+    rep = _report(tmp_path, "## 2. Sources of Awkwardness\n\nA Nanode is $5 [[akamai]].\n")
+    assert g.check_file(v, rep).cited_sentences == 1

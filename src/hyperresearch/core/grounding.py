@@ -26,6 +26,9 @@ from pathlib import Path
 
 from hyperresearch.core.patterns import WIKI_LINK_RE
 
+# The report's own source list ("## Sources", "## H. Source List", "## References").
+_SOURCES_HEAD = re.compile(
+    r"^##\s+(?:[A-Z0-9]{1,3}[.)]\s+)?(?:Sources?|References?)(?:\s+(?:List|with\s+dates|cited))?\s*:?\s*$", re.M | re.I)
 _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[\"'“(\[*A-Z0-9])")
 # a trailing "x" is a multiplier ("2-26x annually"), not part of a word
 _NUM = re.compile(r"(?<![\w.])(\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)(?![\d.]\d|[\d]|[a-wyz_])")
@@ -167,7 +170,7 @@ def _cited_ids(sentence: str) -> list[str]:
 
 
 def _sentences(report: str) -> list[tuple[int, str]]:
-    body = re.split(r"^##\s+(?:Sources|References)\b", report, maxsplit=1, flags=re.M | re.I)[0]
+    body = _SOURCES_HEAD.split(report, maxsplit=1)[0]
     out = []
     in_code = False
     for ln, line in enumerate(body.splitlines(), 1):
@@ -264,12 +267,92 @@ def check_report(report_text: str, bodies: dict[str, str | None]) -> GroundingRe
     return res
 
 
+_NUM_CITE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\](?!\()")
+_SRC_LINE = re.compile(r"^\s*(?:[-*]\s*)?\[(\d+)\]\s*(.*)$")
+_URL = re.compile(r"https?://[^\s)>\]]+")
+
+
+def _norm_url(u: str) -> str:
+    u = u.strip().rstrip(".,;)").lower()
+    u = re.sub(r"^https?://(www\.)?", "", u)
+    u = u.split("#", 1)[0]
+    return u.rstrip("/")
+
+
+def _url_index(vault_root: Path) -> dict[str, str]:
+    """source URL (normalized) -> note id, from every research note's frontmatter."""
+    out: dict[str, str] = {}
+    notes = vault_root / "research" / "notes"
+    if not notes.is_dir():
+        return out
+    for p in notes.glob("*.md"):
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            continue
+        if not head.startswith("---"):
+            continue
+        m = re.search(r"^source:\s*['\"]?(\S+?)['\"]?\s*$", head.split("---", 2)[1] if head.count("---") >= 2 else "", re.M)
+        if m:
+            out.setdefault(_norm_url(m.group(1)), p.stem)
+    return out
+
+
+def resolve_numbered_citations(text: str, url_to_id: dict[str, str]) -> tuple[str, list[str]]:
+    """Rewrite inline-style `[N]` / `[7, 12]` markers into `[[note-id]]` links so the
+    grounding check covers numbered-citation reports too. N is looked up in the
+    report's own `## Sources` list (`[N] Title. URL`), then URL -> note id.
+    A number with no Sources entry, no URL, or no matching note becomes a link to
+    `unresolved-citation-N`, which the check reports as dangling (fail closed).
+    Returns (rewritten text, list of unresolved numbers)."""
+    parts = _SOURCES_HEAD.split(text, maxsplit=1)
+    if len(parts) < 2:
+        body, sources = text, ""
+    else:
+        body, sources = parts[0], parts[1]
+    num_to_id: dict[str, str] = {}
+    for line in sources.splitlines():
+        m = _SRC_LINE.match(line)
+        if not m:
+            continue
+        u = _URL.search(m.group(2))
+        if u and _norm_url(u.group(0)) in url_to_id:
+            num_to_id[m.group(1)] = url_to_id[_norm_url(u.group(0))]
+    unresolved: list[str] = []
+
+    def sub(m: re.Match) -> str:
+        links = []
+        for n in re.split(r"\s*,\s*", m.group(1)):
+            nid = num_to_id.get(n)
+            if not nid:
+                unresolved.append(n)
+                nid = f"unresolved-citation-{n}"
+            links.append(f"[[{nid}]]")
+        return " ".join(links)
+
+    new_body = _NUM_CITE.sub(sub, body)
+    head = _SOURCES_HEAD.search(text)
+    if head is None:
+        return new_body, list(dict.fromkeys(unresolved))
+    return new_body + text[head.start():], list(dict.fromkeys(unresolved))
+
+
 def check_file(vault_root: Path, report_path: Path) -> GroundingResult:
     text = report_path.read_text(encoding="utf-8-sig")
+    if _NUM_CITE.search(_SOURCES_HEAD.split(text, maxsplit=1)[0]):
+        text, _ = resolve_numbered_citations(text, _url_index(vault_root))
     ids = set()
     for _, s in _sentences(text):
         ids.update(_cited_ids(s))
-    return check_report(text, load_note_bodies(vault_root, ids))
+    res = check_report(text, load_note_bodies(vault_root, ids))
+    if res.cited_sentences == 0:
+        # A report the gate can't read is not "grounded". Fail closed so it
+        # can't publish as verified (a [N]-cited report once passed with 0 checked).
+        res.findings.append(Finding(
+            "vacuous", "(whole report)",
+            ["no cited sentences found: citations missing or in a format the check can't read"],
+            [], 0))
+    return res
 
 
 def write_findings(path: Path, result: GroundingResult) -> None:
